@@ -1,0 +1,20 @@
+# 视频翻译配音工具依赖
+
+# ASR 语音识别
+faster-whisper
+torch
+onnxruntime
+
+# 在线翻译
+deep_translator
+
+# 视频处理
+moviepy
+Pillow
+
+# 配音合成
+TTS
+
+# 离线翻译（可选，用于本地翻译版本）
+transformers
+sentencepiece

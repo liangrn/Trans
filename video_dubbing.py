@@ -42,6 +42,20 @@ import time
 FFMPEG_BIN = os.environ.get('FFMPEG_BIN', 'ffmpeg')
 FONT_PATH_OVERRIDE = os.environ.get('SUBTITLE_FONT_PATH', None)
 
+# 中文常见语气词列表（用于过滤ASR识别的无效片段）
+FILLER_WORDS = {
+    '嗯', '啊', '呃', '哦', '唔', '诶', '哎', '哎哟', '哎呀',
+    '哼', '哈', '嘿', '哇', '咦', '噢', '噢噢',
+    '嗯嗯', '啊啊', '呃呃', '哦哦'
+}
+
+def is_filler_word(text):
+    """检查文本是否只包含语气词"""
+    import re
+    # 移除所有标点和空格
+    clean_text = re.sub(r'[^\w]', '', text.strip())
+    return clean_text in FILLER_WORDS or clean_text == ''
+
 def run_ffmpeg_cmd(cmd_list):
     try:
         # 如果命令以 'ffmpeg' 开头，使用可配置的 FFMPEG_BIN 替换
@@ -1008,9 +1022,20 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         try:
             model = WhisperModel(model_size, device=device, compute_type=compute_type)
-            segments, info = model.transcribe(input_video_path, language="zh",
-                                              task="transcribe", beam_size=10,
-                                              best_of=5, patience=1.0)
+            segments, info = model.transcribe(
+                input_video_path,
+                language="zh",
+                task="transcribe",
+                beam_size=10,
+                best_of=5,
+                patience=1.0,
+                word_timestamps=True,  # 启用词级时间戳，提高时间精度
+                vad_filter=True,       # 启用 VAD 过滤非语音片段
+                vad_parameters={
+                    "min_silence_duration_ms": 500,  # 最小静音时长
+                    "speech_pad_ms": 200,            # 语音前后填充
+                }
+            )
             
             original_segments_data = []
             for segment in segments:
@@ -1018,10 +1043,18 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                     continue
                 actual_end = min(segment.end, video_duration)
                 duration = actual_end - segment.start
+                # 过滤短片段
                 if duration < 0.3:
                     continue
+
+                # 过滤语气词片段
+                text = segment.text.strip()
+                if is_filler_word(text):
+                    print(f"  - 过滤语气词: [{segment.start:.1f}s] '{text}'")
+                    continue
+
                 original_segments_data.append({
-                    "text": segment.text.strip(),
+                    "text": text,
                     "start": segment.start,
                     "end": actual_end,
                     "original_duration": duration
@@ -1093,6 +1126,20 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         )
 
         # 5.2 顺序处理音频速度调整和片段创建
+        # === 诊断日志：追踪片段处理状态 ===
+        print("\n=== 片段处理详情 (400s-550s 时间段) ===")
+        for i, r in enumerate(tts_results):
+            if r and r.get("seg_data"):
+                seg = r["seg_data"]
+                start = seg.get('start', -1)
+                # 只打印 6:48 (408s) 到 9:00 (540s) 的片段
+                if 400 <= start <= 550:
+                    print(f"  [{i}] {start:.1f}s-{seg.get('end', 0):.1f}s | "
+                          f"原文: {seg.get('original_text', '')[:30]} | "
+                          f"翻译: {seg.get('translated_text', '')[:30]} | "
+                          f"成功: {r.get('success')}")
+        print("=" * 50 + "\n")
+
         for i, tts_result in enumerate(tts_results):
             if not tts_result or not tts_result.get("success"):
                 continue
@@ -1102,6 +1149,15 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
 
             print(f"\n--- 处理片段 {i+1}/{len(tts_results)} ---")
             print(f"    原时间: [{seg_data['start']:.2f}s -> {seg_data['end']:.2f}s], 时长: {seg_data['original_duration']:.2f}s")
+
+            # === 诊断日志：检查 TTS 原始时长 ===
+            if 400 <= seg_data['start'] <= 550:
+                try:
+                    from pydub import AudioSegment
+                    tts_audio = AudioSegment.from_wav(temp_tts_file)
+                    print(f"    [诊断] TTS原始时长: {len(tts_audio)/1000:.2f}s, 目标时长: {seg_data['original_duration']:.2f}s")
+                except Exception as diag_e:
+                    print(f"    [诊断] 无法读取TTS音频: {diag_e}")
 
             # 调整音频速度
             tmp_adj = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')

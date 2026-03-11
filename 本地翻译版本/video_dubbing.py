@@ -853,9 +853,20 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         try:
             model = WhisperModel(model_size, device=device, compute_type=compute_type)
-            segments, info = model.transcribe(input_video_path, language="zh",
-                                              task="transcribe", beam_size=10,
-                                              best_of=5, patience=1.0)
+            segments, info = model.transcribe(
+                input_video_path,
+                language="zh",
+                task="transcribe",
+                beam_size=10,
+                best_of=5,
+                patience=1.0,
+                word_timestamps=True,  # 启用词级时间戳，提高时间精度
+                vad_filter=True,       # 启用 VAD 过滤非语音片段
+                vad_parameters={
+                    "min_silence_duration_ms": 500,  # 最小静音时长
+                    "speech_pad_ms": 200,            # 语音前后填充
+                }
+            )
             
             original_segments_data = []
             for segment in segments:
