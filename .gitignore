@@ -1,0 +1,19 @@
+# 视频/音频文件
+*.mp4
+*.wav
+*.mp3
+*.mov
+*.avi
+
+# 目录
+input/
+output/
+tmp/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+
+# 系统文件
+.DS_Store
+Thumbs.db
