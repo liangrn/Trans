@@ -1512,7 +1512,7 @@ def merge_videos_from_directory(output_dir, merged_filename, video_extension=".m
         print(f"   3. 视频文件是否被其他程序占用")
         return False
 
-def batch_process_videos(input_dir, output_dir, target_language, selected_voice_key, max_speed_factor, min_speed_factor, available_voices, video_extension=".mp4", parallel=True, workers=10):
+def batch_process_videos(input_dir, output_dir, target_language, selected_voice_key, max_speed_factor, min_speed_factor, available_voices, video_extension=".mp4", parallel=True, workers=10, tts_workers=3):
     """批量处理指定目录下的所有视频文件
 
     Args:
@@ -1526,6 +1526,7 @@ def batch_process_videos(input_dir, output_dir, target_language, selected_voice_
         video_extension: 视频文件扩展名
         parallel: 是否启用并行翻译
         workers: 并行翻译线程数
+        tts_workers: 并行 TTS 生成线程数
     """
     print(f"\n--- 开始批量处理视频 ---")
     print(f"输入目录: {input_dir}")
@@ -1533,6 +1534,7 @@ def batch_process_videos(input_dir, output_dir, target_language, selected_voice_
     print(f"目标语言: {target_language}")
     print(f"选择声音: {selected_voice_key}")
     print(f"并行翻译: {'启用' if parallel else '禁用'} (线程数: {workers})")
+    print(f"并行 TTS: 线程数: {tts_workers}")
 
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -1585,7 +1587,8 @@ def batch_process_videos(input_dir, output_dir, target_language, selected_voice_
             min_speed_factor,
             available_voices,
             parallel=parallel,
-            workers=workers
+            workers=workers,
+            tts_workers=tts_workers
         )
         if not success:
             print(f"警告: 处理 '{input_video_path}' 时失败。跳过此文件。")
@@ -1647,10 +1650,11 @@ def main():
         print(f"选择声音: {args.voice}")
         print(f"输出视频: {args.output_video}")
         print(f"并行翻译: {'启用' if args.parallel else '禁用'} (线程数: {args.workers})")
+        print(f"并行 TTS: 线程数: {args.tts_workers}")
         success = process_single_video(
             args.input_video, args.target_lang, args.voice,
             args.output_video, args.max_speed, args.min_speed, available_voices,
-            parallel=args.parallel, workers=args.workers
+            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers
         )
         if success:
              print("\n--- 单文件处理完成 ---")
@@ -1669,7 +1673,7 @@ def main():
         batch_process_videos(
             args.input_dir, args.output_dir, args.target_lang, args.voice,
             args.max_speed, args.min_speed, available_voices,
-            parallel=args.parallel, workers=args.workers
+            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers
         )
         print("\n--- 批量处理完成 ---")
 
@@ -1686,7 +1690,7 @@ def main():
         batch_process_videos(
             args.input_dir, args.output_dir, args.target_lang, args.voice,
             args.max_speed, args.min_speed, available_voices,
-            parallel=args.parallel, workers=args.workers
+            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers
         )
         print("\n--- 批量处理完成，开始合并 ---")
         merge_videos_from_directory(args.output_dir, args.merged_filename)
