@@ -145,8 +145,6 @@ def get_available_coqui_voices():
     # 英语 印尼语 韩语 日语 越南语 西班牙语 土耳其语 葡萄牙语 印地语 阿拉伯语 泰语 法语支持
     voices = {
         # ==================== 男声模型 ====================
-        # SAM Tacotron (明确的男声模型)
-        "en_sam_tacotron": {"model_name": "tts_models/en/sam/tacotron-DDC", "description": "SAM Tacotron (标准男声, 清晰)"},
         # VCTK 男声 (VITS架构)
         "en_vctk_vits_m001": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p231", "description": "VITS (VCTK, 男声1, 深沉)"},
         "en_vctk_vits_m002": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p232", "description": "VITS (VCTK, 男声2, 温和)"},
@@ -164,12 +162,6 @@ def get_available_coqui_voices():
         "en_vctk_vits_m014": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p264", "description": "VITS (VCTK, 男声14, 沉稳)"},
         "en_vctk_vits_m015": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p265", "description": "VITS (VCTK, 男声15, 温和)"},
         "en_vctk_vits_m016": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p266", "description": "VITS (VCTK, 男声16, 磁性)"},
-        # VCTK FastPitch 男声
-        "en_vctk_fast_pitch_m001": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p225", "description": "FastPitch (VCTK, 男声, 快速)"},
-        "en_vctk_fast_pitch_m002": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p231", "description": "FastPitch (VCTK, 男声, 温和)"},
-        "en_vctk_fast_pitch_m003": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p236", "description": "FastPitch (VCTK, 男声, 沉稳)"},
-        "en_vctk_fast_pitch_m004": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p239", "description": "FastPitch (VCTK, 男声, 磁性)"},
-        "en_vctk_fast_pitch_m005": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p245", "description": "FastPitch (VCTK, 男声, 浑厚)"},
         # VCTK 女声 (VITS架构) - 精选50个不同风格
         "en_vctk_vits_f001": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p225", "description": "VITS (VCTK, 女声1, 甜美清晰)"},
         "en_vctk_vits_f002": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p226", "description": "VITS (VCTK, 女声2, 温柔优雅)"},
@@ -619,7 +611,7 @@ def synthesize_speech_coqui_single(tts_instance, speaker_idx, text, output_file,
         except:
             pass
     
-    print(f"    - TTS输入: '{text}' (原: '{original_text}')")
+    #print(f"    - TTS输入: '{text}' (原: '{original_text}')")
     
     # ===== 2. 生成音频（带重试机制）=====
     max_retries = 2
@@ -690,13 +682,13 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
     # 根据视频分辨率调整
     if video_height >= 1080:
         font_size = int(base_font_size * 1.4)
-        estimated_height = 150
+        estimated_height = 180
     elif video_height >= 720:
         font_size = int(base_font_size * 1.2)
-        estimated_height = 130
+        estimated_height = 150
     else:
         font_size = int(base_font_size * 1.0)
-        estimated_height = 110
+        estimated_height = 120
     img_width = video_width
     # ========== 2. 创建透明背景 ==========
     subtitle_img = Image.new('RGBA', (img_width, estimated_height), color=(0, 0, 0, 0))
@@ -736,7 +728,7 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         for font_path in mac_font_paths:
             if os.path.exists(font_path):
                 try:
-                    print(f"    - 尝试加载: {os.path.basename(font_path)}")
+                    #print(f"    - 尝试加载: {os.path.basename(font_path)}")
                     if font_path.endswith('.ttc'):
                         # 对于字体集合，尝试不同索引
                         for index in [0, 1, 2]:
@@ -746,7 +738,7 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
                                 test_text = "Test"
                                 bbox = font.getbbox(test_text)
                                 if bbox:
-                                    print(f"    - 成功加载: {os.path.basename(font_path)} (索引:{index})")
+                                    #print(f"    - 成功加载: {os.path.basename(font_path)} (索引:{index})")
                                     return font
                             except:
                                 continue
@@ -756,7 +748,7 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
                         test_text = "Test"
                         bbox = font.getbbox(test_text)
                         if bbox:
-                            print(f"    - 成功加载: {os.path.basename(font_path)}")
+                            #print(f"    - 成功加载: {os.path.basename(font_path)}")
                             return font
                 except Exception as e:
                     print(f"    - 加载失败 {os.path.basename(font_path)}: {e}")
@@ -818,13 +810,13 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
     # 根据系统选择字体加载函数
     import sys
     if sys.platform == 'darwin':
-        print("    - 系统: macOS")
+        #print("    - 系统: macOS")
         font = get_font_for_mac(font_size)
     elif sys.platform.startswith('win'):
-        print("    - 系统: Windows")
+        #print("    - 系统: Windows")
         font = get_font_for_windows(font_size)
     else:
-        print("    - 系统: Linux/其他")
+        #print("    - 系统: Linux/其他")
         font = ImageFont.load_default()
 
     # ========== 4. 确保font是有效的字体对象 ==========
@@ -839,28 +831,58 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         'es': 18, 'fr': 18, 'ru': 18, 'default': 18
     }
     avg_char_width = char_widths.get(base_lang, char_widths['default'])
-    max_chars = max(10, int(img_width * 0.7 / avg_char_width))
+    max_chars = max(10, int(img_width * 0.9 / avg_char_width))  # 使用90%宽度，减少行数
 
-    # ========== 6. 文本换行 ==========
-    def simple_wrap(text, max_chars):
-        """简单的文本换行"""
+    # ========== 6. 文本换行（按单词换行，避免截断） ==========
+    def smart_wrap(text, max_chars, lang):
+        """智能文本换行 - 按单词边界换行，避免单词截断"""
         if not text:
             return []
-        if len(text) <= max_chars:
+
+        # 中文、日文、韩文等不使用空格分词的语言，按字符换行
+        if lang in ['zh', 'ja', 'ko']:
+            if len(text) <= max_chars:
+                return [text]
+            lines = []
+            current_line = ""
+            for char in text:
+                if len(current_line) >= max_chars:
+                    lines.append(current_line)
+                    current_line = char
+                else:
+                    current_line += char
+            if current_line:
+                lines.append(current_line)
+            return lines
+
+        # 其他语言（英文等）按单词换行
+        words = text.split(' ')
+        if not words:
             return [text]
+
         lines = []
         current_line = ""
-        for char in text:
-            if len(current_line) >= max_chars:
-                lines.append(current_line)
-                current_line = char
+
+        for word in words:
+            # 如果当前行为空，直接添加单词
+            if not current_line:
+                current_line = word
+            # 如果添加这个单词不超过最大长度，添加到当前行
+            elif len(current_line) + 1 + len(word) <= max_chars:
+                current_line += ' ' + word
             else:
-                current_line += char
+                # 当前行已满，开始新行
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+
+        # 添加最后一行
         if current_line:
             lines.append(current_line)
-        return lines
 
-    lines = simple_wrap(text, max_chars)
+        return lines if lines else [text]
+
+    lines = smart_wrap(text, max_chars, base_lang)
 
     # ========== 7. 计算位置 ==========
     # 计算每行高度
@@ -910,34 +932,34 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         else:
             text_color = (255, 255, 255, 255)  # 其他用白色
 
-        # 首先绘制文字描边（增强可读性）
-        outline_color = (0, 0, 0, 200)
-        # 简化描边 - 只绘制主要方向的阴影
-        offsets = [(2, 2), (2, -2), (-2, 2), (-2, -2)]
-        for dx, dy in offsets:
-            try:
-                draw.text((text_x + dx, current_y + dy), line,
-                          fill=outline_color, font=font)
-            except Exception as e:
-                print(f"    - 描边绘制失败: {e}")
-                # 继续尝试
+        # 首先绘制文字描边（使用stroke_width参数，更平滑清晰）
+        outline_color = (0, 0, 0, 255)
+        stroke_width = 2  # 描边宽度（适中）
 
-        # 然后绘制主文字
+        # 尝试使用PIL的stroke参数（Pillow 8.0+支持）
         try:
             draw.text((text_x, current_y), line,
-                      fill=text_color, font=font)
-            print(f"    - 成功绘制: {line[:20]}...")
-        except Exception as e:
-            print(f"    - 主文字绘制失败: {e}")
-            # 尝试使用ASCII回退
+                      fill=text_color, font=font,
+                      stroke_width=stroke_width, stroke_fill=outline_color)
+            #print(f"    - 成功绘制（stroke模式）: {line[:20]}...")
+        except TypeError:
+            # 旧版Pillow不支持stroke，使用传统描边方式
+            for dx, dy in [(3, 0), (-3, 0), (0, 3), (0, -3),
+                           (2, 2), (2, -2), (-2, 2), (-2, -2)]:
+                try:
+                    draw.text((text_x + dx, current_y + dy), line,
+                              fill=outline_color, font=font)
+                except Exception as e:
+                    print(f"    - 描边绘制失败: {e}")
+            # 绘制主文字
             try:
-                ascii_line = line.encode('ascii', 'ignore').decode()
-                if ascii_line:
-                    draw.text((text_x, current_y), ascii_line,
-                              fill=text_color, font=font)
-                    print(f"    - 使用ASCII回退: {ascii_line[:20]}...")
-            except:
-                print(f"    - ASCII回退也失败")
+                draw.text((text_x, current_y), line,
+                          fill=text_color, font=font)
+                print(f"    - 成功绘制（传统模式）: {line[:20]}...")
+            except Exception as e:
+                print(f"    - 主文字绘制失败: {e}")
+        except Exception as e:
+            print(f"    - 绘制失败: {e}")
 
         # 更新Y位置
         current_y += line_heights[i] + 8
@@ -947,7 +969,7 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
     os.close(temp_img_fd)
     try:
         subtitle_img.save(temp_img_path, format='PNG', optimize=True)
-        print(f"    - 字幕图片保存: {temp_img_path}")
+        #print(f"    - 字幕图片保存: {temp_img_path}")
     except Exception as e:
         print(f"    - 图片保存失败: {e}")
         # 创建简单的错误图片
@@ -958,7 +980,7 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
     try:
         clip = ImageClip(temp_img_path, duration=duration).set_start(start_time).set_position(('center', 'bottom'))
         clip.temp_path = temp_img_path
-        print(f"    - 字幕片段创建成功: {duration:.2f}s")
+        #print(f"    - 字幕片段创建成功: {duration:.2f}s")
         return clip
     except Exception as e:
         print(f"    - 创建ImageClip失败: {e}")
