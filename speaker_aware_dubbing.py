@@ -55,6 +55,7 @@ class Config:
 # =====================================================================
 
 _diarization_future = None      # Future 对象
+_diarization_executor = None    # ThreadPoolExecutor，保持引用防止GC
 _diarization_waveform = None    # 供后续步骤复用的 waveform
 _diarization_sr = None
 _diarization_audio_path = None  # 临时文件路径，用完后清理
@@ -77,10 +78,9 @@ def run_diarization_async(video_path: str, hf_token: str = None):
     if not token:
         return
 
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diarize")
-    _diarization_future = executor.submit(_run_full_pipeline, video_path, token)
-    # 不关闭 executor，让 future 在后台完成
-    executor._threads  # keep reference
+    global _diarization_executor
+    _diarization_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diarize")
+    _diarization_future = _diarization_executor.submit(_run_full_pipeline, video_path, token)
     print("[说话人识别] 已在后台启动，与 ASR 并行运行...")
 
 
@@ -100,6 +100,11 @@ def wait_diarization() -> Dict[str, Dict]:
         print(f"[说话人识别] 后台任务异常: {e}")
         _diarization_future = None
         return {}
+    finally:
+        global _diarization_executor
+        if _diarization_executor is not None:
+            _diarization_executor.shutdown(wait=False)
+            _diarization_executor = None
 
 
 # =====================================================================

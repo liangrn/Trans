@@ -88,7 +88,9 @@ def run_ffmpeg_cmd(cmd_list):
 
 def adjust_audio_speed_ffmpeg(input_file, output_file, target_duration, max_speed_factor=2.0, min_speed_factor=0.5):
     """
-    调整音频速度，但限制最大/最小速度变化
+    调整音频速度：
+    - TTS 比目标时长短 → 原速播放，不拉伸（剩余时间自动静音）
+    - TTS 比目标时长长 → 加速压缩，最大 max_speed_factor
     """
     original_clip = AudioFileClip(input_file)
     original_duration = original_clip.duration
@@ -97,16 +99,16 @@ def adjust_audio_speed_ffmpeg(input_file, output_file, target_duration, max_spee
         import shutil
         shutil.copy(input_file, output_file)
         return original_duration, 1.0
-    # 计算需要的速度因子，但限制在合理范围内
     raw_speed_factor = original_duration / target_duration
-    # 限制速度变化范围
+    # TTS 比目标短：原速播放，不拉伸
+    if raw_speed_factor <= 1.0:
+        import shutil
+        shutil.copy(input_file, output_file)
+        return original_duration, 1.0
+    # TTS 比目标长：加速压缩
     if raw_speed_factor > max_speed_factor:
         print(f"    - 警告: 速度因子 {raw_speed_factor:.2f}x 超过上限 {max_speed_factor}x，将使用 {max_speed_factor}x")
         speed_factor = max_speed_factor
-        final_duration = original_duration / speed_factor
-    elif raw_speed_factor < min_speed_factor:
-        print(f"    - 警告: 速度因子 {raw_speed_factor:.2f}x 低于下限 {min_speed_factor}x，将使用 {min_speed_factor}x")
-        speed_factor = min_speed_factor
         final_duration = original_duration / speed_factor
     else:
         speed_factor = raw_speed_factor
@@ -179,22 +181,22 @@ def get_available_coqui_voices():
         "en_vctk_vits_m015": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p265", "description": "VITS (VCTK, 男声15, 温和)"},
         "en_vctk_vits_m016": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p266", "description": "VITS (VCTK, 男声16, 磁性)"},
         # VCTK 女声 (VITS架构) - 精选50个不同风格
-        "en_vctk_vits_f001": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p225", "description": "VITS (VCTK, 女声1, 甜美清晰)"},
-        "en_vctk_vits_f002": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p226", "description": "VITS (VCTK, 女声2, 温柔优雅)"},
-        "en_vctk_vits_f003": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p227", "description": "VITS (VCTK, 女声3, 明亮活泼)"},
-        "en_vctk_vits_f004": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p228", "description": "VITS (VCTK, 女声4, 柔和自然)"},
-        "en_vctk_vits_f005": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p229", "description": "VITS (VCTK, 女声5, 端庄大方)"},
-        "en_vctk_vits_f006": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p230", "description": "VITS (VCTK, 女声6, 清新自然)"},
-        "en_vctk_vits_f007": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p234", "description": "VITS (VCTK, 女声7, 温暖亲切)"},
-        "en_vctk_vits_f008": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p237", "description": "VITS (VCTK, 女声8, 成熟稳重)"},
-        "en_vctk_vits_f009": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p240", "description": "VITS (VCTK, 女声9, 清脆悦耳)"},
-        "en_vctk_vits_f010": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p241", "description": "VITS (VCTK, 女声10, 柔和甜美)"},
-        "en_vctk_vits_f011": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p243", "description": "VITS (VCTK, 女声11, 明亮自信)"},
-        "en_vctk_vits_f012": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p244", "description": "VITS (VCTK, 女声12, 清新活泼)"},
-        "en_vctk_vits_f013": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p246", "description": "VITS (VCTK, 女声13, 温柔细腻)"},
-        "en_vctk_vits_f014": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p247", "description": "VITS (VCTK, 女声14, 优雅知性)"},
-        "en_vctk_vits_f015": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p249", "description": "VITS (VCTK, 女声15, 开朗热情)"},
-        "en_vctk_vits_f016": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p250", "description": "VITS (VCTK, 女声16, 柔和亲切)"},
+        "en_vctk_vits_f001": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p225", "description": "VITS (VCTK, 女声1, 甜美清晰"},
+        "en_vctk_vits_f002": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p227", "description": "VITS (VCTK, 女声2, 明亮活泼"},
+        "en_vctk_vits_f003": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p237", "description": "VITS (VCTK, 女声3, 成熟稳重"},
+        "en_vctk_vits_f004": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p240", "description": "VITS (VCTK, 女声4, 清脆悦耳"},
+        "en_vctk_vits_f005": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p243", "description": "VITS (VCTK, 女声5, 明亮自信"},
+        "en_vctk_vits_f006": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p244", "description": "VITS (VCTK, 女声6, 清新活泼"},
+        "en_vctk_vits_f007": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p246", "description": "VITS (VCTK, 女声7, 温柔细腻"},
+        "en_vctk_vits_f008": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p247", "description": "VITS (VCTK, 女声8, 优雅知性"},
+        "en_vctk_vits_f009": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p249", "description": "VITS (VCTK, 女声9, 开朗热情"},
+        "en_vctk_vits_f010": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p250", "description": "VITS (VCTK, 女声10, 柔和亲切"},
+        "en_vctk_vits_f011": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p225", "description": "VITS (VCTK, 女声11, 柔和亲切)"},
+        "en_vctk_vits_f012": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p227", "description": "VITS (VCTK, 女声12, 清新活泼)"},
+        "en_vctk_vits_f013": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p237", "description": "VITS (VCTK, 女声13, 温柔细腻)"},
+        "en_vctk_vits_f014": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p240", "description": "VITS (VCTK, 女声14, 优雅知性)"},
+        "en_vctk_vits_f015": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p243", "description": "VITS (VCTK, 女声15, 开朗热情)"},
+        "en_vctk_vits_f016": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p244", "description": "VITS (VCTK, 女声16, 柔和亲切)"},
         # VCTK FastPitch 女声
         #"en_vctk_fast_pitch_f001": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p225", "description": "FastPitch (VCTK, 女声1, 快速清晰)"},
         #"en_vctk_fast_pitch_f002": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p234", "description": "FastPitch (VCTK, 女声2, 快速温暖)"},
@@ -1051,7 +1053,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         print(f"视频时长: {video_duration:.2f}s")
         
-        # ===== 在ASR开始前后台启动说话人分离（与ASR并行）=====
+        # ===== 在ASR前后台启动说话人分离（与ASR并行）=====
         if SPEAKER_AWARE_AVAILABLE:
             _hf_token = os.environ.get('HF_TOKEN', '')
             if _hf_token:
@@ -1083,6 +1085,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             )
             
             original_segments_data = []
+            filtered_intervals = []   # 被过滤片段的时间区间（不能当停顿借用）
             for segment in segments:
                 if segment.start >= video_duration:
                     continue
@@ -1090,12 +1093,14 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 duration = actual_end - segment.start
                 # 过滤短片段
                 if duration < 0.3:
+                    filtered_intervals.append((segment.start, actual_end))
                     continue
 
                 # 过滤语气词片段
                 text = segment.text.strip()
                 if is_filler_word(text):
                     print(f"  - 过滤语气词: [{segment.start:.1f}s] '{text}'")
+                    filtered_intervals.append((segment.start, actual_end))
                     continue
 
                 original_segments_data.append({
@@ -1118,7 +1123,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         del model
         gc.collect()
 
-        # ===== Step 2: 取说话人分离结果（ASR期间已在后台运行）=====
+        # ===== Step 2: 取说话人分离结果（ASR期间已后台运行）=====
         speaker_map = {}
         speaker_voice_map = {}
         if SPEAKER_AWARE_AVAILABLE:
@@ -1173,27 +1178,72 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         # ==========================
 
         # _timing_patch_applied
-        # ===== 时间对齐优化：计算每片段可用时长 =====
-        # 步骤①：每片段可用时长 = 自身时长 + 可借用的前间隔（最多1.0s）
-        # 步骤②：计算全局膨胀比，对超速片段微调 start
+        # ===== 时间对齐：一遍清晰版 =====
+        # 每段借用"本段后面的停顿"来容纳更长的TTS
+        # adjusted_start 往前移动借用量，确保音频不溢出到下一段
         if translated_segments_data:
-            # 为每个片段计算可借用的前间隔
-            for i, seg in enumerate(translated_segments_data):
-                if i == 0:
-                    gap_before = 0.0
-                else:
-                    prev = translated_segments_data[i - 1]
-                    gap_before = seg["start"] - prev["end"]
-                # 最多借用 1.0s，且间隔必须 > 0.1s 才值得借
-                borrow = min(max(gap_before - 0.1, 0.0), 1.0)
-                seg["available_duration"] = seg["original_duration"] + borrow
-                seg["gap_before"] = gap_before
+            import re
 
-            # 统计全局膨胀情况（用于日志）
-            orig_total = sum(s["original_duration"] for s in translated_segments_data)
-            print(f"  - 片段总时长: {orig_total:.1f}s")
-            print(f"  - 借用间隔后可用时长提升: "
-                  f"{sum(s['available_duration'] for s in translated_segments_data):.1f}s")
+            def _est_tts(text):
+                """按字符数估算TTS时长"""
+                t = text.strip()
+                zh = len(re.findall(r'[\u4e00-\u9fff]', t))
+                en = len(re.findall(r'[a-zA-Z]+', t))
+                oth = max(0, len(t) - zh - en * 4)
+                return max(zh * 0.38 + en * 0.42 + oth * 0.1, 0.3)
+
+            n = len(translated_segments_data)
+            borrowed_count = 0
+            prev_audio_end = 0.0  # 上一段音频的实际结束时间
+
+            for i, seg in enumerate(translated_segments_data):
+                orig_dur   = seg["original_duration"]
+                orig_start = seg["start"]
+                orig_end   = seg["end"]
+                tts_est    = _est_tts(seg["translated_text"])
+
+                # 本段后面到下一段的停顿（扣除被过滤片段占用的时间）
+                if i + 1 < n:
+                    next_start = translated_segments_data[i + 1]["start"]
+                else:
+                    next_start = video_duration
+                raw_gap = max(0.0, next_start - orig_end)
+                # 被过滤片段的时间不能当停顿借用（那里有原始声音）
+                blocked = sum(
+                    min(fe, next_start) - max(fs, orig_end)
+                    for fs, fe in filtered_intervals
+                    if fs < next_start and fe > orig_end
+                )
+                gap_after = max(0.0, raw_gap - max(0.0, blocked))
+
+                # 可借用量：不超过溢出量，不超过90%停顿
+                overflow   = max(0.0, tts_est - orig_dur)
+                can_borrow = min(overflow, gap_after * 0.9)
+                avail      = orig_dur + can_borrow
+
+                # adjusted_start：借了多少就往前移多少
+                # 但不能早于上一段音频的结束时间（防止同声音重叠）
+                if can_borrow > 0.05:
+                    adjusted_start = max(prev_audio_end, orig_start - can_borrow)
+                    borrowed_count += 1
+                else:
+                    adjusted_start = max(prev_audio_end, orig_start)
+
+                # 双重保险：确保音频结束时间不超过下一段开始
+                audio_end = adjusted_start + avail
+                if audio_end > next_start - 0.05:
+                    avail = max(orig_dur, next_start - 0.05 - adjusted_start)
+
+                # 硬限制：不超出视频结尾
+                avail = min(avail, max(orig_dur, video_duration - adjusted_start - 0.05))
+
+                seg["available_duration"] = avail
+                seg["adjusted_start"]     = adjusted_start
+
+                # 记录本段音频结束时间，供下一段使用
+                prev_audio_end = adjusted_start + avail
+
+            print(f"  - 时间对齐: 借停顿={borrowed_count}段")
         # =============================================
 
         # Step 4: 加载TTS模型
@@ -1249,9 +1299,11 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             temp_files_to_cleanup.append(temp_adjusted_file)
 
             try:
-                # 用 available_duration（含借用间隔）替代 original_duration
-                _avail = seg_data.get('available_duration', seg_data['original_duration'])
-                _gap   = seg_data.get('gap_before', 0.0)
+                # adjusted_start 和 available_duration 在时间对齐阶段已算好，直接用
+                _avail   = seg_data.get('available_duration', seg_data['original_duration'])
+                _start_t = seg_data.get('adjusted_start', seg_data['start'])
+                _eaten   = max(0.0, _avail - seg_data['original_duration'])
+
                 final_duration, speed_factor = adjust_audio_speed_ffmpeg(
                     temp_tts_file,
                     temp_adjusted_file,
@@ -1259,14 +1311,9 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                     max_speed_factor=max_speed_factor,
                     min_speed_factor=min_speed_factor
                 )
-                # 如果借用了间隔，把 start 提前相应时长
-                _borrow = _avail - seg_data['original_duration']
-                if _borrow > 0.05:
-                    seg_data['_adjusted_start'] = max(0.0, seg_data['start'] - _borrow)
-                else:
-                    seg_data['_adjusted_start'] = seg_data['start']
+                seg_data['_adjusted_start'] = _start_t
                 print(f"    调整后时长: {final_duration:.2f}s, 速度: {speed_factor:.2f}x"
-                      + (f", 借用间隔: {_borrow:.2f}s" if _borrow > 0.05 else ""))
+                      + (f", 借停顿: {_eaten:.2f}s start={_start_t:.2f}s" if _eaten > 0.05 else ""))
             except Exception as e:
                 print(f"    - 音频速度调整失败: {e}")
                 continue
@@ -1274,7 +1321,12 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             # 创建音频片段
             try:
                 _start = seg_data.get('_adjusted_start', seg_data['start'])
-                adjusted_clip = AudioFileClip(temp_adjusted_file).set_start(_start)
+                _raw_clip = AudioFileClip(temp_adjusted_file)
+                # subclip 到 avail 时长，防止 ffmpeg 输出误差导致实际文件比计划长
+                _clip_dur = seg_data.get('available_duration', _raw_clip.duration)
+                if _raw_clip.duration > _clip_dur + 0.05:
+                    _raw_clip = _raw_clip.subclip(0, _clip_dur)
+                adjusted_clip = _raw_clip.set_start(_start)
                 final_audio_clips_for_composition.append(adjusted_clip)
             except Exception as e:
                 print(f"    - 创建音频片段失败: {e}")
@@ -1333,10 +1385,11 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             
             silent_audio = create_silent_audio(video_duration)
             
-            # 6.2 组合音频
+            # 6.2 组合音频（设置总时长=视频时长，防止音频溢出导致黑屏）
             all_audio_clips = [silent_audio] + final_audio_clips_for_composition
             final_audio_track = CompositeAudioClip(all_audio_clips)
-            
+            final_audio_track = final_audio_track.set_duration(video_duration)
+
             # 6.3 应用音频到视频
             video_with_new_audio = original_video.set_audio(final_audio_track)
             
@@ -1827,8 +1880,8 @@ def main():
                         help="选择配音声音")
     parser.add_argument("--max_speed", type=float, default=1.5,
                         help="最大语速加速倍数 (默认: 1.5，超过此值听感明显失真)")
-    parser.add_argument("--min_speed", type=float, default=0.5,
-                        help="最小语速减慢倍数 (默认: 0.7)")
+    parser.add_argument("--min_speed", type=float, default=1.0,
+                        help="最小语速倍数 (默认: 1.0，TTS短于原始时长时原速播放不拉伸)")
     parser.add_argument("--merged_filename", default="merged_output.mp4",
                         help="合并后视频的文件名 (默认: merged_output.mp4)")
     parser.add_argument("--ffmpeg_bin", dest='ffmpeg_bin', default=None,

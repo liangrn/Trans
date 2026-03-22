@@ -135,14 +135,24 @@ class GenderClassifier:
 
         try:
             if self._use_full_model and self._gender_model is not None:
-                import tempfile, soundfile as sf, os
+                # 直接传 waveform，不写临时文件
+                import tempfile, soundfile as sf, os as _os
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp_path = tmp.name
                 sf.write(tmp_path, waveform, Config.SAMPLE_RATE)
-                with torch.no_grad():
-                    result = self._gender_model.predict(tmp_path, torch.device(self.device))
-                os.unlink(tmp_path)
-                gender = "female" if "female" in str(result).lower() else "male"
+                try:
+                    with torch.no_grad():
+                        result = self._gender_model.predict(tmp_path, torch.device(self.device))
+                finally:
+                    _os.unlink(tmp_path)
+                # 解析输出：result 可能是字符串 "female"/"male" 或包含该词的对象
+                result_str = str(result).lower()
+                if "female" in result_str:
+                    gender = "female"
+                elif "male" in result_str:
+                    gender = "male"
+                else:
+                    gender = "female"  # 默认
                 return gender, 0.90
 
             elif self._ecapa_model is not None and self._gender_head is not None:

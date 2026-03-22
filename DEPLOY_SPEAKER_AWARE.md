@@ -20,6 +20,7 @@
 打开命令提示符（CMD），在程序目录下执行：
 
 ```cmd
+//先进入你的虚拟环境目录，再执行后面的环境安装
 pip install pyannote.audio speechbrain librosa soundfile huggingface_hub
 ```
 
@@ -69,7 +70,7 @@ git clone https://github.com/JaesungHuh/voice-gender-classifier.git
 **操作方法：**
 1. 右键「此电脑」→「属性」→「高级系统设置」→「环境变量」
 2. 在「用户变量」区点击「新建」
-3. 变量名：`HF_TOKEN`，变量值：`hf_你的token内容`
+3. 变量名：`HF_TOKEN`，变量值：`上一步你获取的token内容`
 4. 点击确定，**重新打开 CMD 使其生效**
 
 验证是否生效：
