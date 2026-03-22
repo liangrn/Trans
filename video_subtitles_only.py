@@ -1,8 +1,9 @@
 """视频纯翻译字幕生成工具 (无配音版) - 修复版
 功能：读取视频 -> 识别语音 -> 翻译文本 -> 生成字幕 -> 合成输出"""
-import argparse
 import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import tempfile
+import argparse
 import textwrap
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
@@ -761,18 +762,48 @@ def process_single_video(input_video_path, target_language, output_video_path, p
         # ========== 2. 翻译 ==========
         print(f"\n[2/3] 翻译为 {target_language}...")
 
+        def _calc_subtitle_duration(translated_text, original_duration, seg_start,
+                                       next_seg_start=None, video_duration=video_duration):
+            """
+            计算字幕显示时长：
+            - 基准 = 原始语音时长
+            - 按翻译文字数估算阅读时长（每字0.25s，最少2s）
+            - 取两者较大值，但不超过到下一段开始（留0.1s间隔）
+            """
+            chars = len(translated_text.strip())
+            reading_time = max(2.0, chars * 0.25)
+            best = max(original_duration, reading_time)
+            # 不能超出到下一段（或视频结尾）
+            if next_seg_start is not None:
+                limit = next_seg_start - seg_start - 0.1
+            else:
+                limit = video_duration - seg_start - 0.1
+            return min(best, max(original_duration, limit))
+
+        # 构建下一段开始时间表（用于限制字幕时长）
+        next_starts = {}
+        for i, seg in enumerate(original_segments_data):
+            if i + 1 < len(original_segments_data):
+                next_starts[i] = original_segments_data[i + 1]["start"]
+
         if parallel and len(original_segments_data) > 1:
             # 并行翻译
             translated_results = translate_segments_parallel(
                 original_segments_data, target_language, max_workers=workers
             )
+            # 按原始顺序排好（translate_segments_parallel 已保序）
+            sorted_results = sorted(translated_results, key=lambda r: r["idx"])
 
-            for result in translated_results:
+            for i, result in enumerate(sorted_results):
                 try:
+                    sub_dur = _calc_subtitle_duration(
+                        result["translated"], result["duration"], result["start"],
+                        next_starts.get(i)
+                    )
                     sub_clip = create_subtitle_clip(
                         result["translated"],
                         result["start"],
-                        result["duration"],
+                        sub_dur,
                         video_width,
                         video_height,
                         target_language
@@ -787,12 +818,15 @@ def process_single_video(input_video_path, target_language, output_video_path, p
             for i, seg in enumerate(original_segments_data):
                 translated_text = translate_text(seg["text"], target_language)
                 print(f" [{i+1}] {seg['text'][:30]}... -> {translated_text[:30]}...")
-
                 try:
+                    sub_dur = _calc_subtitle_duration(
+                        translated_text, seg["duration"], seg["start"],
+                        next_starts.get(i)
+                    )
                     sub_clip = create_subtitle_clip(
                         translated_text,
                         seg["start"],
-                        seg["duration"],
+                        sub_dur,
                         video_width,
                         video_height,
                         target_language
@@ -803,12 +837,12 @@ def process_single_video(input_video_path, target_language, output_video_path, p
                 except Exception as e:
                     print(f" - 字幕生成失败: {e}")
         
-        # ========== 3. 合成视频 ==========
-        print("\n[3/3] 合成最终视频 (仅字幕)...")
-        
-        # 释放ASR模型内存
+        # 释放ASR模型内存（翻译完成后立即释放，不等到合成）
         del model
         gc.collect()
+
+        # ========== 3. 合成视频 ==========
+        print("\n[3/3] 合成最终视频 (仅字幕)...")
         
         try:
             final_clip = CompositeVideoClip([original_video] + subtitle_clips, size=original_video.size)

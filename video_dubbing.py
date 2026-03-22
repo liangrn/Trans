@@ -35,13 +35,15 @@ import json
 # ===== 说话人感知配音 =====
 try:
     from speaker_aware_dubbing import (
+        run_diarization_async,
+        wait_diarization,
         analyze_speakers_for_video,
         build_speaker_voice_map,
         get_voice_for_segment,
     )
     SPEAKER_AWARE_AVAILABLE = True
 except ImportError as _e:
-    print(f'[警告] 说话人感知配音模块未找到: {_e}，将使用单一声音')
+    print(f'[警告] 说话人模块未找到: {_e}，使用单一声音')
     SPEAKER_AWARE_AVAILABLE = False
 # ===========================
 
@@ -194,11 +196,11 @@ def get_available_coqui_voices():
         "en_vctk_vits_f015": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p249", "description": "VITS (VCTK, 女声15, 开朗热情)"},
         "en_vctk_vits_f016": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p250", "description": "VITS (VCTK, 女声16, 柔和亲切)"},
         # VCTK FastPitch 女声
-        "en_vctk_fast_pitch_f001": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p225", "description": "FastPitch (VCTK, 女声1, 快速清晰)"},
-        "en_vctk_fast_pitch_f002": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p234", "description": "FastPitch (VCTK, 女声2, 快速温暖)"},
-        "en_vctk_fast_pitch_f003": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p254", "description": "FastPitch (VCTK, 女声3, 快速活力)"},
-        "en_vctk_fast_pitch_f004": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p257", "description": "FastPitch (VCTK, 女声4, 快速甜美)"},
-        "en_vctk_fast_pitch_f005": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p280", "description": "FastPitch (VCTK, 女声5, 快速成熟)"},
+        #"en_vctk_fast_pitch_f001": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p225", "description": "FastPitch (VCTK, 女声1, 快速清晰)"},
+        #"en_vctk_fast_pitch_f002": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p234", "description": "FastPitch (VCTK, 女声2, 快速温暖)"},
+        #"en_vctk_fast_pitch_f003": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p254", "description": "FastPitch (VCTK, 女声3, 快速活力)"},
+        #"en_vctk_fast_pitch_f004": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p257", "description": "FastPitch (VCTK, 女声4, 快速甜美)"},
+        #"en_vctk_fast_pitch_f005": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p280", "description": "FastPitch (VCTK, 女声5, 快速成熟)"},
         # ==================== 印尼语 (Indonesian) ====================
         # 印尼语男声
         "id_male_001": {"model_name": "tts_models/id/common-voice/vits", "speaker_idx": "id_male_1", "description": "VITS (印尼语, 男声1, 标准)"},
@@ -1049,6 +1051,13 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         print(f"视频时长: {video_duration:.2f}s")
         
+        # ===== 在ASR开始前后台启动说话人分离（与ASR并行）=====
+        if SPEAKER_AWARE_AVAILABLE:
+            _hf_token = os.environ.get('HF_TOKEN', '')
+            if _hf_token:
+                run_diarization_async(input_video_path, _hf_token)
+        # =========================================================
+
         # Step 1: 语音识别
         print("\n[1/6] 语音识别...")
         model_size = "small"
@@ -1109,19 +1118,19 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         del model
         gc.collect()
 
-        # ===== Step 2: 说话人分离 + 性别识别 =====
+        # ===== Step 2: 取说话人分离结果（ASR期间已在后台运行）=====
         speaker_map = {}
         speaker_voice_map = {}
         if SPEAKER_AWARE_AVAILABLE:
-            print('\n[2/6] 说话人分离 + 性别识别...')
-            hf_token = os.environ.get('HF_TOKEN', '')
-            if hf_token:
-                speaker_map = analyze_speakers_for_video(input_video_path, hf_token)
+            print('\n[2/6] 获取说话人分离结果...')
+            _hf_token = os.environ.get('HF_TOKEN', '')
+            if _hf_token:
+                speaker_map = wait_diarization()
+                if not speaker_map:
+                    print('  [说话人识别] 后台结果为空，使用单一声音')
             else:
-                print('  [跳过] 未设置 HF_TOKEN 环境变量')
-        else:
-            print('\n[2/6] 说话人识别模块不可用，跳过')
-        # ===========================================
+                print('  [跳过] 未设置 HF_TOKEN')
+        # =============================================================
         
         # Step 3: 翻译
         print(f"\n[3/6] 翻译为 {target_language}...")
@@ -1163,6 +1172,30 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             )
         # ==========================
 
+        # _timing_patch_applied
+        # ===== 时间对齐优化：计算每片段可用时长 =====
+        # 步骤①：每片段可用时长 = 自身时长 + 可借用的前间隔（最多1.0s）
+        # 步骤②：计算全局膨胀比，对超速片段微调 start
+        if translated_segments_data:
+            # 为每个片段计算可借用的前间隔
+            for i, seg in enumerate(translated_segments_data):
+                if i == 0:
+                    gap_before = 0.0
+                else:
+                    prev = translated_segments_data[i - 1]
+                    gap_before = seg["start"] - prev["end"]
+                # 最多借用 1.0s，且间隔必须 > 0.1s 才值得借
+                borrow = min(max(gap_before - 0.1, 0.0), 1.0)
+                seg["available_duration"] = seg["original_duration"] + borrow
+                seg["gap_before"] = gap_before
+
+            # 统计全局膨胀情况（用于日志）
+            orig_total = sum(s["original_duration"] for s in translated_segments_data)
+            print(f"  - 片段总时长: {orig_total:.1f}s")
+            print(f"  - 借用间隔后可用时长提升: "
+                  f"{sum(s['available_duration'] for s in translated_segments_data):.1f}s")
+        # =============================================
+
         # Step 4: 加载TTS模型
         print("\n[4/6] 加载TTS模型...")
         voice_config = available_voices.get(selected_voice_key,
@@ -1198,19 +1231,6 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             )
 
         # 5.2 顺序处理音频速度调整和片段创建
-        # === 诊断日志：追踪片段处理状态 ===
-        print("\n=== 片段处理详情 (400s-550s 时间段) ===")
-        for i, r in enumerate(tts_results):
-            if r and r.get("seg_data"):
-                seg = r["seg_data"]
-                start = seg.get('start', -1)
-                # 只打印 6:48 (408s) 到 9:00 (540s) 的片段
-                if 400 <= start <= 550:
-                    print(f"  [{i}] {start:.1f}s-{seg.get('end', 0):.1f}s | "
-                          f"原文: {seg.get('original_text', '')[:30]} | "
-                          f"翻译: {seg.get('translated_text', '')[:30]} | "
-                          f"成功: {r.get('success')}")
-        print("=" * 50 + "\n")
 
         for i, tts_result in enumerate(tts_results):
             if not tts_result or not tts_result.get("success"):
@@ -1222,15 +1242,6 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             print(f"\n--- 处理片段 {i+1}/{len(tts_results)} ---")
             print(f"    原时间: [{seg_data['start']:.2f}s -> {seg_data['end']:.2f}s], 时长: {seg_data['original_duration']:.2f}s")
 
-            # === 诊断日志：检查 TTS 原始时长 ===
-            if 400 <= seg_data['start'] <= 550:
-                try:
-                    from pydub import AudioSegment
-                    tts_audio = AudioSegment.from_wav(temp_tts_file)
-                    print(f"    [诊断] TTS原始时长: {len(tts_audio)/1000:.2f}s, 目标时长: {seg_data['original_duration']:.2f}s")
-                except Exception as diag_e:
-                    print(f"    [诊断] 无法读取TTS音频: {diag_e}")
-
             # 调整音频速度
             tmp_adj = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
             temp_adjusted_file = tmp_adj.name
@@ -1238,21 +1249,32 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             temp_files_to_cleanup.append(temp_adjusted_file)
 
             try:
+                # 用 available_duration（含借用间隔）替代 original_duration
+                _avail = seg_data.get('available_duration', seg_data['original_duration'])
+                _gap   = seg_data.get('gap_before', 0.0)
                 final_duration, speed_factor = adjust_audio_speed_ffmpeg(
                     temp_tts_file,
                     temp_adjusted_file,
-                    seg_data['original_duration'],
+                    _avail,
                     max_speed_factor=max_speed_factor,
                     min_speed_factor=min_speed_factor
                 )
-                print(f"    调整后时长: {final_duration:.2f}s, 速度因子: {speed_factor:.2f}x")
+                # 如果借用了间隔，把 start 提前相应时长
+                _borrow = _avail - seg_data['original_duration']
+                if _borrow > 0.05:
+                    seg_data['_adjusted_start'] = max(0.0, seg_data['start'] - _borrow)
+                else:
+                    seg_data['_adjusted_start'] = seg_data['start']
+                print(f"    调整后时长: {final_duration:.2f}s, 速度: {speed_factor:.2f}x"
+                      + (f", 借用间隔: {_borrow:.2f}s" if _borrow > 0.05 else ""))
             except Exception as e:
                 print(f"    - 音频速度调整失败: {e}")
                 continue
 
             # 创建音频片段
             try:
-                adjusted_clip = AudioFileClip(temp_adjusted_file).set_start(seg_data['start'])
+                _start = seg_data.get('_adjusted_start', seg_data['start'])
+                adjusted_clip = AudioFileClip(temp_adjusted_file).set_start(_start)
                 final_audio_clips_for_composition.append(adjusted_clip)
             except Exception as e:
                 print(f"    - 创建音频片段失败: {e}")
@@ -1261,9 +1283,10 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             # 创建字幕片段
             if final_duration > 0.1:
                 try:
+                    _start = seg_data.get('_adjusted_start', seg_data['start'])
                     subtitle_clip = create_subtitle_clip(
                         seg_data["translated_text"],
-                        seg_data['start'],
+                        _start,
                         min(final_duration, seg_data['original_duration'] * 1.5),
                         video_width,
                         video_height,
@@ -1802,8 +1825,8 @@ def main():
     parser.add_argument("--target_lang", help="目标语言代码 (单文件和多文件处理模式),例如：en, ja, ko, fr, pt, es, id, vi, tr, hi, ar, th, de, it")
     parser.add_argument("--voice", default="en_sam_tacotron", choices=available_voices.keys(),
                         help="选择配音声音")
-    parser.add_argument("--max_speed", type=float, default=2.0,
-                        help="最大语速加速倍数 (默认: 1.8)")
+    parser.add_argument("--max_speed", type=float, default=1.5,
+                        help="最大语速加速倍数 (默认: 1.5，超过此值听感明显失真)")
     parser.add_argument("--min_speed", type=float, default=0.5,
                         help="最小语速减慢倍数 (默认: 0.7)")
     parser.add_argument("--merged_filename", default="merged_output.mp4",

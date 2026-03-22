@@ -13,8 +13,6 @@
 |------|------|
 | `speaker_aware_dubbing.py` | 说话人识别集成模块 |
 | `gender_classifier.py` | 性别识别模块（替换原有版本） |
-| `patch_video_dubbing.py` | 一次性 patch 工具，运行一次后可删除 |
-
 ---
 
 ## 第一步：安装新增 Python 依赖
@@ -79,18 +77,6 @@ git clone https://github.com/JaesungHuh/voice-gender-classifier.git
 echo %HF_TOKEN%
 ```
 能看到 token 内容即为成功。
-
----
-
-## 第五步：打 Patch（仅需运行一次）
-
-在程序目录的 CMD 中执行：
-
-```cmd
-python patch_video_dubbing.py
-```
-
-看到 `✅ 所有 patch 完成！` 即可。此后 `patch_video_dubbing.py` 可以删除。
 
 ---
 
