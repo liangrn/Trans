@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Environment Setup
+
+**IMPORTANT**: All commands must be run in the `iai` conda environment:
+
+```bash
+conda activate iai
+# Then run any python commands
+```
+
 ## Project Overview
 
 Video translation and dubbing tool that processes videos through speech recognition, translation, and optional voice synthesis. Supports both online (Google Translate) and offline (NLLB-200) translation modes.
@@ -23,6 +32,10 @@ python video_subtitles_only.py --mode batch_merge --input_dir ./input --output_d
 
 # Merge existing videos only (no processing)
 python video_subtitles_only.py --mode merge_only --output_dir ./output --merged_filename final.mp4
+
+# Speaker diarization + gender recognition
+python test_diarization.py input/video.mp4
+python test_diarization.py input/video.mp4 --threshold 0.5 --min-speakers 2 --max-speakers 4
 ```
 
 ## Supported Target Languages
@@ -45,6 +58,8 @@ python video_subtitles_only.py --mode merge_only --output_dir ./output --merged_
 |------|---------|
 | `video_dubbing.py` | Full pipeline with TTS voice synthesis |
 | `video_subtitles_only.py` | Subtitle-only version, no voice synthesis |
+| `test_diarization.py` | Speaker diarization using pyannote |
+| `gender_classifier.py` | Gender classification using F0 + spectral analysis |
 | `本地翻译版本/video_dubbing.py` | Dubbing with offline NLLB translation |
 | `本地翻译版本/local_translator.py` | NLLB-200 3.3B translation wrapper |
 
@@ -65,6 +80,7 @@ Uses FFmpeg concat demuxer for lossless, fast merging. Requires videos to have i
 - TTS (Coqui TTS for voice synthesis)
 - moviepy, PIL/Pillow (video/image processing)
 - ffmpeg, ffprobe (external binaries for video processing)
+- pyannote.audio, librosa, scipy, speechbrain (speaker diarization + gender recognition)
 
 ## Directory Structure
 

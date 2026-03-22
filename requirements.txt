@@ -18,3 +18,11 @@ TTS
 # 离线翻译（可选，用于本地翻译版本）
 transformers
 sentencepiece
+
+# 说话人分离和性别识别
+pyannote.audio
+librosa
+scipy
+soundfile
+# 开源性别识别（推荐，提高准确率）
+speechbrain
