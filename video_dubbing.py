@@ -31,6 +31,20 @@ warnings.filterwarnings("ignore", message="You are sending unauthenticated reque
 import glob
 import tempfile
 import json
+
+# ===== 说话人感知配音 =====
+try:
+    from speaker_aware_dubbing import (
+        analyze_speakers_for_video,
+        build_speaker_voice_map,
+        get_voice_for_segment,
+    )
+    SPEAKER_AWARE_AVAILABLE = True
+except ImportError as _e:
+    print(f'[警告] 说话人感知配音模块未找到: {_e}，将使用单一声音')
+    SPEAKER_AWARE_AVAILABLE = False
+# ===========================
+
 import platform
 from pathlib import Path
 import shutil
@@ -1094,6 +1108,20 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         # 释放 ASR 模型内存
         del model
         gc.collect()
+
+        # ===== Step 2: 说话人分离 + 性别识别 =====
+        speaker_map = {}
+        speaker_voice_map = {}
+        if SPEAKER_AWARE_AVAILABLE:
+            print('\n[2/6] 说话人分离 + 性别识别...')
+            hf_token = os.environ.get('HF_TOKEN', '')
+            if hf_token:
+                speaker_map = analyze_speakers_for_video(input_video_path, hf_token)
+            else:
+                print('  [跳过] 未设置 HF_TOKEN 环境变量')
+        else:
+            print('\n[2/6] 说话人识别模块不可用，跳过')
+        # ===========================================
         
         # Step 3: 翻译
         print(f"\n[3/6] 翻译为 {target_language}...")
@@ -1127,6 +1155,14 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 if i < 5:
                     print(f"  [{i}] {seg['text'][:40]}... -> {translated_text[:40]}...")
 
+        # ===== 分配说话人声音 =====
+        if SPEAKER_AWARE_AVAILABLE and speaker_map:
+            print('\n[3/6] 分配说话人声音...')
+            speaker_voice_map = build_speaker_voice_map(
+                speaker_map, target_language, available_voices, selected_voice_key
+            )
+        # ==========================
+
         # Step 4: 加载TTS模型
         print("\n[4/6] 加载TTS模型...")
         voice_config = available_voices.get(selected_voice_key,
@@ -1142,10 +1178,24 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         print("\n[5/6] 生成并调整配音音频...")
 
         # 5.1 并行生成所有 TTS 音频
-        tts_results, tts_temp_files = generate_tts_parallel(
-            translated_segments_data, tts_model, tts_speaker_idx, target_language,
-            max_workers=tts_workers
-        )
+        # 说话人感知：为每个片段标记对应的 voice_key
+        if SPEAKER_AWARE_AVAILABLE and speaker_map and speaker_voice_map:
+            for seg in translated_segments_data:
+                seg['_voice_key'] = get_voice_for_segment(
+                    seg['start'], seg['end'],
+                    speaker_map, speaker_voice_map, selected_voice_key
+                )
+            # 按 voice_key 分组，每组用自己的 TTS 模型生成
+            tts_results, tts_temp_files = _generate_tts_multi_voice(
+                translated_segments_data, target_language,
+                available_voices, selected_voice_key,
+                torch.cuda.is_available(), max_workers=tts_workers
+            )
+        else:
+            tts_results, tts_temp_files = generate_tts_parallel(
+                translated_segments_data, tts_model, tts_speaker_idx, target_language,
+                max_workers=tts_workers
+            )
 
         # 5.2 顺序处理音频速度调整和片段创建
         # === 诊断日志：追踪片段处理状态 ===
@@ -1677,6 +1727,68 @@ def batch_process_videos(input_dir, output_dir, target_language, selected_voice_
 #多文件处理:python video_dubbing.py --mode batch --input_dir ./input --output_dir ./output --target_lang pt --voice pt_male_001
 #多文件处理+合并:python video_dubbing.py --mode batch_merge --input_dir ./input --output_dir ./output --target_lang pt --voice pt_male_001 --merged_filename final_movie.mp4
 #仅合并:python video_dubbing.py --mode merge_only --output_dir ./output --merged_filename final_movie.mp4
+def _generate_tts_multi_voice(
+    segments_data, target_lang, available_voices,
+    fallback_voice_key, gpu_available, max_workers=3
+):
+    """
+    按说话人分组，为每组加载对应 TTS 模型并生成音频。
+    保持原始片段顺序，返回与 generate_tts_parallel() 相同格式。
+    """
+    import gc
+
+    # 收集所有不同的 voice_key
+    voice_keys = list(dict.fromkeys(
+        seg.get("_voice_key", fallback_voice_key) for seg in segments_data
+    ))
+    print(f"  - 多说话人配音: {len(voice_keys)} 种声音")
+    for vk in voice_keys:
+        count = sum(1 for s in segments_data if s.get("_voice_key", fallback_voice_key) == vk)
+        print(f"    {vk}: {count} 片段")
+
+    results = [None] * len(segments_data)
+    all_temp_files = []
+
+    for voice_key in voice_keys:
+        # 找到属于该声音的片段（保留原始 index）
+        group = [(i, seg) for i, seg in enumerate(segments_data)
+                 if seg.get("_voice_key", fallback_voice_key) == voice_key]
+        if not group:
+            continue
+
+        voice_config = available_voices.get(voice_key, available_voices.get(fallback_voice_key, {}))
+        print(f"\n  - 加载声音模型: {voice_key}")
+        try:
+            tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_available)
+        except Exception as e:
+            print(f"    - 模型加载失败: {e}，使用 fallback")
+            fallback_cfg = available_voices.get(fallback_voice_key, {})
+            tts_model, tts_speaker_idx = load_coqui_tts_model(fallback_cfg, gpu_available)
+
+        # 只取该组的 seg_data 列表
+        group_segs = [seg for _, seg in group]
+        group_results, group_temps = generate_tts_parallel(
+            group_segs, tts_model, tts_speaker_idx, target_lang,
+            max_workers=max_workers
+        )
+        all_temp_files.extend(group_temps)
+
+        # 把结果放回原始顺序
+        for (orig_idx, _), res in zip(group, group_results):
+            results[orig_idx] = res
+
+        del tts_model
+        gc.collect()
+
+    # 填补 None（不应发生，保险起见）
+    for i, r in enumerate(results):
+        if r is None:
+            results[i] = {"idx": i, "temp_tts_file": None,
+                          "seg_data": segments_data[i], "success": False}
+
+    return results, all_temp_files
+
+
 def main():
     parser = argparse.ArgumentParser(description="视频配音替换与批量处理工具")
     available_voices = get_available_coqui_voices()

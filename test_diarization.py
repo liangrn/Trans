@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-说话人分离 + 性别识别 - 影视场景优化版
+说话人分离 + 性别识别 - 影视场景优化版 v3
 
-主要改进：
-1. pyannote 参数针对影视多人场景调优（放宽说话人数、细化聚类）
-2. 性别识别改为"先聚合所有片段，再统一判断"，准确率大幅提升
-3. 增加说话人合并后处理（解决同一人被识别成多人问题）
-4. 增加 --num-speakers 参数，已知人数时可强制指定
+优化点：
+1. 音频只加载一次，传给所有后续步骤
+2. 模型只初始化一次（GenderClassifier 单例）
+3. 短片段过滤：时间线输出默认只显示 >= 1s 的片段
+4. 说话人合并使用已有的 ECAPA embedding，不重复加载模型
+5. --min-display-duration 控制时间线最小显示时长
 
 环境: conda activate iai
-依赖: pip install pyannote.audio speechbrain librosa scipy torch soundfile
+依赖: pip install pyannote.audio speechbrain librosa scipy torch soundfile huggingface_hub
 """
 
 import os
@@ -24,30 +25,28 @@ import numpy as np
 
 warnings.filterwarnings("ignore")
 
+
 # =================== 配置 ===================
 class Config:
     SAMPLE_RATE = 16000
-    MIN_SEGMENT_DURATION = 0.5      # 有效片段最短时长（秒）
+    MIN_SEGMENT_DURATION = 0.5       # pyannote 片段最短时长（过滤噪声）
+    MIN_DISPLAY_DURATION = 1.0       # 时间线显示最短时长（可通过参数覆盖）
 
-    # pyannote 影视场景参数
+    # pyannote 4.x
     DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
-    # 聚类阈值：越小越容易把两人分开（影视建议 0.4~0.6）
-    # 如果同一人被分成多人 → 调大；不同人被合并 → 调小
     CLUSTERING_THRESHOLD = 0.45
-    MIN_CLUSTER_SIZE = 2
-    MIN_DURATION_OFF = 0.1          # 静音间隔阈值（影视场景说话切换快）
+    MIN_DURATION_OFF = 0.1
 
-    # 说话人数量限制（影视对话通常 2~8 人）
+    # 说话人数量
     MIN_SPEAKERS = 2
-    MAX_SPEAKERS = 8                # 设置上限避免过度分割
+    MAX_SPEAKERS = 8
 
-    # 说话人合并：两个说话人 embedding 余弦相似度超过此值则合并
-    MERGE_COSINE_THRESHOLD = 0.75
+    # 说话人合并：余弦相似度高于此值合并（相同性别）
+    MERGE_COSINE_THRESHOLD = 0.82
 
-    # 性别识别
-    GENDER_CONF_THRESHOLD = 0.55    # 低于此值标记为 unknown
+    # 性别置信度低于此值标记为 unknown
+    GENDER_CONF_THRESHOLD = 0.55
 
-    # HuggingFace Token（建议用环境变量替代）
     HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 
@@ -63,7 +62,7 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"    [错误] ffmpeg 失败: {result.stderr.strip()[-200:]}")
+        print(f"  [错误] ffmpeg: {result.stderr.strip()[-300:]}")
         return False
     return os.path.exists(audio_path)
 
@@ -77,56 +76,54 @@ def load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
 
 def perform_diarization(audio_path: str, hf_token: str,
                         num_speakers: Optional[int] = None):
-    """
-    使用 pyannote 3.1 进行说话人分离
-
-    Args:
-        num_speakers: 已知说话人数时传入，可大幅提升准确率
-    """
+    """pyannote 4.x 说话人分离"""
     from pyannote.audio import Pipeline
-    import librosa
     import torch
-
-    print(f"[3/5] 说话人分离...")
-    print(f"    模型: {Config.DIARIZATION_MODEL}")
-    if num_speakers:
-        print(f"    指定说话人数: {num_speakers}")
-    else:
-        print(f"    自动检测说话人数 (范围: {Config.MIN_SPEAKERS}~{Config.MAX_SPEAKERS})")
 
     token = hf_token or Config.HF_TOKEN
     if not token:
-        raise ValueError("未设置 HF_TOKEN，请设置环境变量或在 Config 中填入")
+        raise ValueError("请设置 HF_TOKEN 环境变量")
+
+    print(f"[3/5] 说话人分离 (模型: {Config.DIARIZATION_MODEL})...")
+    if num_speakers:
+        print(f"  指定说话人数: {num_speakers}")
+    else:
+        print(f"  自动检测 ({Config.MIN_SPEAKERS}~{Config.MAX_SPEAKERS} 人)")
 
     pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, token=token)
 
-    # 移动到 GPU（如果可用）
     try:
-        import torch
         if torch.cuda.is_available():
             pipeline = pipeline.to(torch.device("cuda"))
-            print("    使用 GPU 加速")
+            print("  使用 GPU 加速")
     except Exception:
         pass
 
-    # 调整内部参数
-    pipeline.instantiate({"segmentation": {"min_duration_off": Config.MIN_DURATION_OFF}, "clustering": {"threshold": Config.CLUSTERING_THRESHOLD}})
+    try:
+        pipeline.instantiate({
+            "segmentation": {"min_duration_off": Config.MIN_DURATION_OFF},
+            "clustering": {"threshold": Config.CLUSTERING_THRESHOLD}
+        })
+    except Exception as e:
+        print(f"  [提示] 参数微调跳过: {e}")
 
+    # 传 waveform tensor 避免 pyannote 4.x AudioDecoder bug
+    import librosa, torch
     waveform, sr = librosa.load(audio_path, sr=Config.SAMPLE_RATE, mono=True)
-    waveform_tensor = torch.from_numpy(waveform.copy()).float().unsqueeze(0)
+    wav_tensor = torch.from_numpy(waveform.copy()).float().unsqueeze(0)
+    audio_input = {"waveform": wav_tensor, "sample_rate": sr}
 
-    # 根据是否已知说话人数选择调用方式
-    kwargs = {"waveform": waveform_tensor, "sample_rate": sr}
-    if num_speakers:
-        diarization = pipeline(kwargs, num_speakers=num_speakers)
-    else:
-        diarization = pipeline(
-            kwargs,
-            min_speakers=Config.MIN_SPEAKERS,
-            max_speakers=Config.MAX_SPEAKERS
-        )
+    try:
+        if num_speakers:
+            output = pipeline(audio_input, num_speakers=num_speakers)
+        else:
+            output = pipeline(audio_input,
+                              min_speakers=Config.MIN_SPEAKERS,
+                              max_speakers=Config.MAX_SPEAKERS)
+    except TypeError:
+        output = pipeline(audio_input)
 
-    return diarization
+    return output
 
 
 def parse_diarization(diarization) -> Dict[str, List[Tuple[float, float]]]:
@@ -136,42 +133,41 @@ def parse_diarization(diarization) -> Dict[str, List[Tuple[float, float]]]:
     def add(start, end, speaker):
         if end - start < Config.MIN_SEGMENT_DURATION:
             return
-        spk = f"SPEAKER_{int(speaker):02d}" if str(speaker).lstrip("-").isdigit() else str(speaker)
+        spk = (f"SPEAKER_{int(speaker):02d}"
+               if str(speaker).lstrip("-").isdigit() else str(speaker))
         speaker_segments.setdefault(spk, []).append((float(start), float(end)))
 
-    # 打印所有可用属性，帮助调试
-    attrs = [a for a in dir(diarization) if not a.startswith('_')]
-    print(f"    [debug] DiarizeOutput 属性: {attrs}")
-
-    if hasattr(diarization, 'speaker_diarization'):
-        print("    [debug] 使用 4.x speaker_diarization 接口")
+    if hasattr(diarization, "speaker_diarization"):
         for turn, speaker in diarization.speaker_diarization:
             add(turn.start, turn.end, speaker)
-    elif hasattr(diarization, 'itertracks'):
-        print("    [debug] 使用 3.x itertracks 接口")
+    elif hasattr(diarization, "itertracks"):
         for turn, _, speaker in diarization.itertracks(yield_label=True):
             add(turn.start, turn.end, speaker)
     else:
         raise RuntimeError(
-            f"未知类型: {type(diarization)}, 属性: {attrs}"
+            f"未知 diarization 类型: {type(diarization)}\n"
+            f"属性: {[a for a in dir(diarization) if not a.startswith('_')]}"
         )
 
-    print(f"    检测到 {len(speaker_segments)} 个说话人")
+    print(f"  检测到 {len(speaker_segments)} 个说话人:")
     for sp, segs in sorted(speaker_segments.items()):
         total = sum(e - s for s, e in segs)
-        print(f"      {sp}: {len(segs)} 段, 共 {total:.1f}s")
+        print(f"    {sp}: {len(segs)} 段, 共 {total:.1f}s")
+
     return speaker_segments
 
+
+# =================== 性别识别 ===================
+
 def identify_genders(
-    audio_path: str,
+    waveform: np.ndarray,
+    sr: int,
     speaker_segments: Dict[str, List[Tuple[float, float]]]
 ) -> Dict[str, Dict]:
     """
-    对每个说话人做性别识别
-
-    改进：聚合该说话人所有片段，统一判断，而非逐段投票
+    性别识别：传入已加载的 waveform，避免重复 IO
     """
-    from gender_classifier import GenderClassifier
+    from gender_classifier import GenderClassifier, Config as GC
 
     print("\n[4/5] 性别识别...")
     classifier = GenderClassifier()
@@ -179,19 +175,19 @@ def identify_genders(
     speaker_info = {}
     for speaker, segments in sorted(speaker_segments.items()):
         total_duration = sum(e - s for s, e in segments)
-        print(f"\n  {speaker} (共 {total_duration:.1f}s, {len(segments)} 段):")
+        valid_count = sum(1 for s, e in segments if e - s >= GC.MIN_DURATION)
+        print(f"\n  {speaker} ({total_duration:.1f}s, {len(segments)} 段, "
+              f"有效 {valid_count} 段):")
 
         gender, confidence, details = classifier.classify_speaker_segments(
-            audio_path, segments, speaker_id=speaker
+            waveform, sr, segments, speaker_id=speaker
         )
 
-        # 置信度不足时标记为 unknown
         if confidence < Config.GENDER_CONF_THRESHOLD:
-            print(f"    → 置信度不足 ({confidence:.2f})，标记为未知")
             gender = "unknown"
 
         gender_zh = {"male": "男", "female": "女", "unknown": "未知"}[gender]
-        print(f"    → 最终: {gender_zh} (置信度={confidence:.2f})")
+        print(f"  → {gender_zh} (置信度={confidence:.2f}, 方法={details.get('method', '?')})")
 
         speaker_info[speaker] = {
             "gender": gender,
@@ -205,192 +201,165 @@ def identify_genders(
     return speaker_info
 
 
-# =================== 说话人合并后处理 ===================
+# =================== 说话人合并 ===================
 
 def merge_oversplit_speakers(
     speaker_info: Dict[str, Dict],
-    audio_path: str
+    waveform: np.ndarray,
+    sr: int
 ) -> Dict[str, Dict]:
     """
-    检测并合并被过度分割的说话人（同一人被识别成多人）
-
-    策略：对所有说话人对，如果性别相同且 embedding 余弦相似度高，则合并。
+    用 ECAPA embedding 检测并合并被过度分割的说话人
+    复用 GenderClassifier 里已加载的 ecapa_model，不重复初始化
     """
-    speakers = list(speaker_info.keys())
-    if len(speakers) <= 1:
+    if len(speaker_info) <= 1:
         return speaker_info
 
-    print("\n  [后处理] 检查过度分割...")
+    print("\n  [合并检查] 计算说话人 embedding 相似度...")
 
-    # 尝试用 SpeechBrain 计算 embedding 相似度
-    try:
-        from gender_classifier import GenderClassifier
-        import librosa, torch
+    from gender_classifier import GenderClassifier
+    classifier = GenderClassifier()
 
-        classifier = GenderClassifier()
-        if not classifier._try_load_speechbrain():
-            print("    SpeechBrain 不可用，跳过合并检查")
-            return speaker_info
+    # 确保模型已加载
+    if not classifier.load_models() or classifier._ecapa_model is None:
+        print("  ECAPA 不可用，跳过合并")
+        return speaker_info
 
-        waveform_full, sr = librosa.load(audio_path, sr=16000, mono=True)
-
-        # 为每个说话人计算平均 embedding（取前 3 段中最长的）
-        speaker_embeddings = {}
-        for sp, info in speaker_info.items():
-            segs = sorted(info["segments"], key=lambda x: x[1]-x[0], reverse=True)[:3]
-            embs = []
-            for start, end in segs:
-                if end - start < 0.5:
-                    continue
-                seg = waveform_full[int(start*sr):int(end*sr)]
-                emb = classifier._get_ecapa_embedding(seg, sr)
-                if emb is not None:
-                    embs.append(emb)
-            if embs:
-                speaker_embeddings[sp] = np.mean(embs, axis=0)
-
-        # 找需要合并的说话人对
-        merged = {}  # old_speaker -> canonical_speaker
-        for i, sp1 in enumerate(speakers):
-            if sp1 in merged:
+    # 每个说话人取最长的 3 段算平均 embedding
+    speaker_embeddings = {}
+    for sp, info in speaker_info.items():
+        segs = sorted(info["segments"], key=lambda x: x[1]-x[0], reverse=True)[:3]
+        embs = []
+        for start, end in segs:
+            if end - start < 1.0:
                 continue
-            for sp2 in speakers[i+1:]:
-                if sp2 in merged:
-                    continue
-                # 只合并相同性别（或其中一个 unknown）
-                g1 = speaker_info[sp1]["gender"]
-                g2 = speaker_info[sp2]["gender"]
-                if g1 != g2 and g1 != "unknown" and g2 != "unknown":
-                    continue
+            seg = waveform[int(start*sr):int(end*sr)]
+            emb = classifier.get_embedding(seg, sr)
+            if emb is not None:
+                embs.append(emb)
+        if embs:
+            speaker_embeddings[sp] = np.mean(embs, axis=0)
 
-                if sp1 not in speaker_embeddings or sp2 not in speaker_embeddings:
-                    continue
+    speakers = list(speaker_info.keys())
+    merged = {}  # sp -> canonical
 
-                emb1 = speaker_embeddings[sp1]
-                emb2 = speaker_embeddings[sp2]
-                cosine = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2) + 1e-8)
+    for i, sp1 in enumerate(speakers):
+        if sp1 in merged:
+            continue
+        for sp2 in speakers[i+1:]:
+            if sp2 in merged:
+                continue
+            g1 = speaker_info[sp1]["gender"]
+            g2 = speaker_info[sp2]["gender"]
+            # 只合并性别相同（或其中一个 unknown）的说话人
+            if g1 != g2 and "unknown" not in (g1, g2):
+                continue
+            if sp1 not in speaker_embeddings or sp2 not in speaker_embeddings:
+                continue
+            e1, e2 = speaker_embeddings[sp1], speaker_embeddings[sp2]
+            cos = float(np.dot(e1, e2) / (np.linalg.norm(e1) * np.linalg.norm(e2) + 1e-8))
+            if cos >= Config.MERGE_COSINE_THRESHOLD:
+                print(f"  合并 {sp2} → {sp1} (余弦={cos:.3f})")
+                merged[sp2] = sp1
 
-                if cosine >= Config.MERGE_COSINE_THRESHOLD:
-                    print(f"    合并 {sp2} → {sp1} (余弦相似度={cosine:.3f})")
-                    merged[sp2] = sp1
-
-        if not merged:
-            print("    无需合并")
-            return speaker_info
-
-        # 执行合并
-        new_info = {}
-        for sp, info in speaker_info.items():
-            canonical = merged.get(sp, sp)
-            if canonical not in new_info:
-                new_info[canonical] = {
-                    "gender": info["gender"],
-                    "confidence": info["confidence"],
-                    "segments": list(info["segments"]),
-                    "total_duration": info["total_duration"],
-                    "segment_count": info["segment_count"],
-                    "details": info["details"],
-                    "merged_from": [],
-                }
-            else:
-                # 合并
-                new_info[canonical]["segments"].extend(info["segments"])
-                new_info[canonical]["total_duration"] += info["total_duration"]
-                new_info[canonical]["segment_count"] += info["segment_count"]
-                new_info[canonical]["merged_from"].append(sp)
-                # 取置信度更高的性别结果
-                if info["confidence"] > new_info[canonical]["confidence"]:
-                    new_info[canonical]["gender"] = info["gender"]
-                    new_info[canonical]["confidence"] = info["confidence"]
-
-        # 重命名（SPEAKER_00, SPEAKER_01, ...）
-        final_info = {}
-        for i, (sp, info) in enumerate(sorted(new_info.items())):
-            new_name = f"SPEAKER_{i:02d}"
-            final_info[new_name] = info
-            if info.get("merged_from"):
-                print(f"    {new_name} (原 {sp} + {', '.join(info['merged_from'])})")
-
-        print(f"    合并后: {len(speaker_info)} → {len(final_info)} 个说话人")
-        return final_info
-
-    except Exception as e:
-        print(f"    合并检查失败: {e}")
+    if not merged:
+        print("  无需合并")
         return speaker_info
 
+    # 执行合并
+    new_info = {}
+    for sp, info in speaker_info.items():
+        canonical = merged.get(sp, sp)
+        if canonical not in new_info:
+            new_info[canonical] = {**info,
+                                   "segments": list(info["segments"]),
+                                   "merged_from": []}
+        else:
+            new_info[canonical]["segments"].extend(info["segments"])
+            new_info[canonical]["total_duration"] += info["total_duration"]
+            new_info[canonical]["segment_count"] += info["segment_count"]
+            new_info[canonical]["merged_from"].append(sp)
+            if info["confidence"] > new_info[canonical]["confidence"]:
+                new_info[canonical]["gender"] = info["gender"]
+                new_info[canonical]["confidence"] = info["confidence"]
 
-# =================== 结果输出 ===================
+    # 重新编号
+    final = {}
+    for i, (sp, info) in enumerate(sorted(new_info.items())):
+        name = f"SPEAKER_{i:02d}"
+        final[name] = info
+        if info.get("merged_from"):
+            print(f"  {name} ← {sp} + {', '.join(info['merged_from'])}")
 
-def print_results(speaker_info: Dict[str, Dict]):
+    print(f"  合并结果: {len(speaker_info)} → {len(final)} 个说话人")
+    return final
+
+
+# =================== 输出 ===================
+
+def print_results(speaker_info: Dict[str, Dict],
+                  min_display_duration: float = 1.0):
     print("\n" + "=" * 65)
     print("说话人分析结果")
     print("=" * 65)
     print(f"\n检测到 {len(speaker_info)} 个说话人:\n")
 
-    for speaker, info in sorted(speaker_info.items()):
-        gender = info.get("gender", "unknown")
-        gender_zh = {"male": "男", "female": "女", "unknown": "未知"}.get(gender, "?")
-        conf = info.get("confidence", 0)
-        duration = info.get("total_duration", 0)
-        seg_count = info.get("segment_count", 0)
-        method = info.get("details", {}).get("method", "?")
-
-        print(f"  {speaker}:")
-        print(f"    性别: {gender_zh}  (置信度={conf:.2f}, 方法={method})")
-        print(f"    总时长: {duration:.1f}s  片段数: {seg_count}")
+    for sp, info in sorted(speaker_info.items()):
+        g = info.get("gender", "unknown")
+        gz = {"male": "男", "female": "女", "unknown": "未知"}.get(g, "?")
+        print(f"  {sp}: {gz}  置信度={info.get('confidence',0):.2f}  "
+              f"时长={info.get('total_duration',0):.1f}s  "
+              f"片段={info.get('segment_count',0)}")
         if info.get("merged_from"):
-            print(f"    合并自: {', '.join(info['merged_from'])}")
-        print()
+            print(f"    (合并自: {', '.join(info['merged_from'])})")
 
-    # 时间线
+    print(f"\n  * 时间线仅显示 >= {min_display_duration}s 的片段")
     print("-" * 65)
     print("时间线:")
     print("-" * 65)
 
     all_segs = []
     for sp, info in speaker_info.items():
-        gender = info.get("gender", "unknown")
+        g = info.get("gender", "unknown")
         for start, end in info.get("segments", []):
-            all_segs.append((start, end, sp, gender))
+            if end - start >= min_display_duration:
+                all_segs.append((start, end, sp, g))
     all_segs.sort()
 
-    for start, end, sp, gender in all_segs:
-        symbol = {"male": "男", "female": "女", "unknown": "?"}.get(gender, "?")
+    for start, end, sp, g in all_segs:
+        gz = {"male": "男", "female": "女", "unknown": "?"}.get(g, "?")
         sm, ss = int(start // 60), start % 60
         em, es = int(end // 60), end % 60
-        dur = end - start
-        print(f"  [{sm:3d}:{ss:05.2f} - {em:3d}:{es:05.2f}] ({dur:4.1f}s) {sp} ({symbol})")
+        print(f"  [{sm:3d}:{ss:05.2f} - {em:3d}:{es:05.2f}] "
+              f"({end-start:4.1f}s) {sp} ({gz})")
 
-    print(f"\n  共 {len(all_segs)} 个片段")
+    total_segs = sum(len(info["segments"]) for info in speaker_info.values())
+    print(f"\n  显示 {len(all_segs)} / 共 {total_segs} 个片段")
 
 
 def export_json(speaker_info: Dict[str, Dict], output_path: str):
-    # segments 是 tuple，需要转成 list
-    serializable = {}
-    for sp, info in speaker_info.items():
-        serializable[sp] = {
-            **info,
-            "segments": [list(seg) for seg in info["segments"]],
-        }
+    out = {sp: {**info, "segments": [list(s) for s in info["segments"]]}
+           for sp, info in speaker_info.items()}
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(serializable, f, ensure_ascii=False, indent=2)
-    print(f"\n[输出] JSON 已保存: {output_path}")
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    print(f"\n[输出] JSON: {output_path}")
 
 
 # =================== 主流程 ===================
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="说话人分离 + 性别识别（影视场景优化）")
-    parser.add_argument("video", help="输入视频/音频文件")
-    parser.add_argument("--output-json", type=str, help="导出 JSON 结果")
+    parser = argparse.ArgumentParser(description="说话人分离+性别识别 (影视优化版)")
+    parser.add_argument("video", help="输入视频/音频")
+    parser.add_argument("--output-json", type=str)
     parser.add_argument("--num-speakers", type=int, default=None,
-                        help="已知说话人数（指定后准确率更高）")
-    parser.add_argument("--hf-token", type=str, default=None,
-                        help="HuggingFace Token（也可设置 HF_TOKEN 环境变量）")
+                        help="已知说话人数（指定后更准确）")
+    parser.add_argument("--hf-token", type=str, default=None)
     parser.add_argument("--clustering-threshold", type=float, default=None,
-                        help=f"聚类阈值（默认={Config.CLUSTERING_THRESHOLD}）"
-                             "；同一人被分多人→调大，不同人被合并→调小")
+                        help=f"聚类阈值 默认={Config.CLUSTERING_THRESHOLD}；"
+                             "同一人被分多人→调大，不同人被合并→调小")
+    parser.add_argument("--min-display-duration", type=float, default=1.0,
+                        help="时间线最小显示时长(秒)，默认=1.0，设0显示全部")
     args = parser.parse_args()
 
     if not os.path.exists(args.video):
@@ -402,13 +371,10 @@ def main():
 
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", Config.HF_TOKEN)
     if not hf_token:
-        print("[错误] 请设置 HF_TOKEN 环境变量，或用 --hf-token 传入")
-        print("  获取: https://huggingface.co/settings/tokens")
+        print("[错误] 请设置 HF_TOKEN 环境变量")
         sys.exit(1)
 
-    print(f"[开始] 处理: {args.video}")
-    if args.num_speakers:
-        print(f"[配置] 指定说话人数: {args.num_speakers}")
+    print(f"[开始] {args.video}")
     print("-" * 65)
 
     audio_path = None
@@ -418,53 +384,44 @@ def main():
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             audio_path = tmp.name
 
-        # 判断输入是视频还是音频
         ext = os.path.splitext(args.video)[1].lower()
         if ext in (".wav", ".mp3", ".flac", ".m4a", ".ogg"):
-            # 直接重采样
             import librosa, soundfile as sf
-            waveform, sr = librosa.load(args.video, sr=Config.SAMPLE_RATE, mono=True)
-            sf.write(audio_path, waveform, Config.SAMPLE_RATE)
-            print(f"    音频文件直接加载，时长: {len(waveform)/Config.SAMPLE_RATE:.1f}s")
+            wav, sr = librosa.load(args.video, sr=Config.SAMPLE_RATE, mono=True)
+            sf.write(audio_path, wav, Config.SAMPLE_RATE)
         else:
             if not extract_audio(args.video, audio_path):
-                print("[错误] 音频提取失败")
                 sys.exit(1)
 
-        # 2. 时长检查
-        waveform_check, sr_check = load_audio(audio_path)
-        duration_total = len(waveform_check) / sr_check
-        print(f"[2/5] 音频时长: {duration_total:.1f}s ({duration_total/60:.1f}min)")
-        del waveform_check
+        # 2. 加载音频（只加载一次，后续复用）
+        print("[2/5] 加载音频...")
+        waveform, sr = load_audio(audio_path)
+        duration = len(waveform) / sr
+        print(f"  时长: {duration:.1f}s ({duration/60:.1f}min)")
 
         # 3. 说话人分离
-        diarization = perform_diarization(
-            audio_path, hf_token,
-            num_speakers=args.num_speakers
-        )
-
-        # 4. 解析分离结果
+        diarization = perform_diarization(audio_path, hf_token, args.num_speakers)
         speaker_segments = parse_diarization(diarization)
 
         if not speaker_segments:
             print("[错误] 未检测到说话人")
             sys.exit(1)
 
-        # 5. 性别识别（聚合判断）
-        speaker_info = identify_genders(audio_path, speaker_segments)
+        # 4. 性别识别（传入已加载的 waveform）
+        speaker_info = identify_genders(waveform, sr, speaker_segments)
 
-        # 6. 说话人合并后处理
+        # 5. 说话人合并（复用已加载的 ECAPA 模型）
         print("\n[5/5] 后处理...")
-        speaker_info = merge_oversplit_speakers(speaker_info, audio_path)
+        speaker_info = merge_oversplit_speakers(speaker_info, waveform, sr)
 
-        # 7. 输出结果
-        print_results(speaker_info)
+        # 输出
+        print_results(speaker_info, min_display_duration=args.min_display_duration)
 
         if args.output_json:
             export_json(speaker_info, args.output_json)
 
     except KeyboardInterrupt:
-        print("\n[中断] 用户取消")
+        print("\n[中断]")
         sys.exit(130)
     except Exception as e:
         print(f"\n[错误] {e}")
