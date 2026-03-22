@@ -13,12 +13,12 @@ conda activate iai
 
 ## Project Overview
 
-Video translation and dubbing tool that processes videos through speech recognition, translation, and optional voice synthesis. Supports both online (Google Translate) and offline (NLLB-200) translation modes.
+Video translation and dubbing tool with multi-speaker support. Features speaker diarization, gender recognition, and voice-appropriate TTS synthesis. Supports both online (Google Translate) and offline (NLLB-200) translation modes.
 
 ## Running Commands
 
 ```bash
-# Single video with dubbing (voice synthesis)
+# Single video with dubbing (multi-speaker voice synthesis)
 python video_dubbing.py --mode single --input_video input/video.mp4 --target_lang en --output_video output/result.mp4
 
 # Single video with subtitles only
@@ -33,9 +33,10 @@ python video_subtitles_only.py --mode batch_merge --input_dir ./input --output_d
 # Merge existing videos only (no processing)
 python video_subtitles_only.py --mode merge_only --output_dir ./output --merged_filename final.mp4
 
-# Speaker diarization + gender recognition
+# Standalone speaker diarization + gender recognition
 python test_diarization.py input/video.mp4
 python test_diarization.py input/video.mp4 --threshold 0.5 --min-speakers 2 --max-speakers 4
+python test_diarization.py input/video.mp4 --num-speakers 4  # Force exact speaker count
 ```
 
 ## Supported Target Languages
@@ -44,24 +45,59 @@ python test_diarization.py input/video.mp4 --threshold 0.5 --min-speakers 2 --ma
 
 ## Architecture
 
-### Processing Pipeline
+### Processing Pipeline (video_dubbing.py)
 
-1. **ASR (Speech Recognition)**: faster-whisper extracts text segments with timestamps
-2. **Translation**: Google Translator (online) or NLLB-200 3.3B (offline)
-3. **Voice Synthesis** (dubbing only): Coqui TTS generates target language audio
-4. **Subtitle Rendering**: PIL generates transparent subtitle images with font fallback
-5. **Video Composition**: MoviePy + FFmpeg combines video, audio, and subtitles
+```
+[1/6] ASR (faster-whisper)          → Extract text segments with timestamps
+[2/6] Speaker Diarization (async)   → pyannote speaker separation (runs in parallel with ASR)
+[3/6] Gender Recognition            → ECAPA-TDNN model + F0 fallback
+[4/6] Translation                   → Google Translate / NLLB-200
+[5/6] TTS Generation                → Multi-voice synthesis (male/female voices)
+[6/6] Video Composition             → MoviePy + FFmpeg final output
+```
 
 ### Key Modules
 
-| File | Purpose |
-|------|---------|
-| `video_dubbing.py` | Full pipeline with TTS voice synthesis |
-| `video_subtitles_only.py` | Subtitle-only version, no voice synthesis |
-| `test_diarization.py` | Speaker diarization using pyannote |
-| `gender_classifier.py` | Gender classification using F0 + spectral analysis |
-| `本地翻译版本/video_dubbing.py` | Dubbing with offline NLLB translation |
-| `本地翻译版本/local_translator.py` | NLLB-200 3.3B translation wrapper |
+| File | Lines | Purpose |
+|------|-------|---------|
+| `video_dubbing.py` | ~2000 | Main pipeline with multi-speaker TTS |
+| `speaker_aware_dubbing.py` | ~550 | Async diarization, speaker merging, voice mapping |
+| `gender_classifier.py` | ~280 | Singleton GenderClassifier with ECAPA model |
+| `test_diarization.py` | ~440 | Standalone diarization + gender test script |
+| `video_subtitles_only.py` | ~1040 | Subtitle-only version (no TTS) |
+| `本地翻译版本/video_dubbing.py` | - | Dubbing with offline NLLB translation |
+| `本地翻译版本/local_translator.py` | - | NLLB-200 3.3B translation wrapper |
+
+### Core Classes
+
+**GenderClassifier** (singleton pattern):
+- Loads `JaesungHuh/ecapa-gender` model for gender classification
+- Loads `speechbrain/spkrec-ecapa-voxceleb` for speaker embeddings
+- Primary: ECAPA model prediction with voting across segments
+- Fallback: F0-based classification (P25 < 155Hz = male, P25 > 195Hz = female)
+
+**SpeakerAwareDubbing**:
+- Async diarization execution with `run_diarization_async()` / `wait_diarization()`
+- Parallel gender recognition via `_identify_genders_parallel()`
+- Speaker merging via embedding cosine similarity (threshold: 0.82)
+- Voice mapping: male speakers → male TTS voice, female speakers → female TTS voice
+
+### Configuration Parameters
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `DIARIZATION_MODEL` | `pyannote/speaker-diarization-community-1` | Speaker separation model |
+| `CLUSTERING_THRESHOLD` | 0.45 | Lower = more speakers detected |
+| `MIN_SPEAKERS` / `MAX_SPEAKERS` | 2 / 8 | Speaker count bounds |
+| `MERGE_COSINE_THRESHOLD` | 0.82 | Speaker merging similarity threshold |
+| `GENDER_CONF_THRESHOLD` | 0.55 | Gender prediction confidence threshold |
+
+### Time Alignment Strategy
+
+1. Pre-estimate TTS duration based on text length
+2. Generate TTS audio
+3. Post-shift segments if TTS runs longer than original
+4. Maintain natural speech timing
 
 ### Environment Variables
 
@@ -74,22 +110,41 @@ Uses FFmpeg concat demuxer for lossless, fast merging. Requires videos to have i
 
 ## Dependencies
 
-- faster-whisper, torch (ASR)
-- deep_translator (Google Translate)
-- transformers, torch (NLLB - offline mode)
-- TTS (Coqui TTS for voice synthesis)
-- moviepy, PIL/Pillow (video/image processing)
-- ffmpeg, ffprobe (external binaries for video processing)
-- pyannote.audio, librosa, scipy, speechbrain (speaker diarization + gender recognition)
+### Core
+- `faster-whisper`, `torch` (ASR)
+- `deep_translator` (Google Translate)
+- `transformers`, `torch` (NLLB - offline mode)
+- `TTS` (Coqui TTS for voice synthesis)
+- `moviepy`, `PIL/Pillow` (video/image processing)
+- `ffmpeg`, `ffprobe` (external binaries)
+
+### Speaker Analysis
+- `pyannote.audio` (speaker diarization)
+- `speechbrain` (ECAPA embeddings + gender model)
+- `huggingface_hub` (model downloads)
+- `librosa`, `scipy` (audio processing)
 
 ## Directory Structure
 
 ```
 Trans/
-├── input/              # Source videos
-├── output/             # Processed videos
-├── tmp/                # Historical versions and experiments
-├── 本地翻译版本/        # Offline translation variant
-├── video_dubbing.py    # Main dubbing script
-└── video_subtitles_only.py  # Subtitle-only script
+├── input/                    # Source videos
+├── output/                   # Processed videos
+├── tmp/                      # Historical versions and experiments
+├── pretrained_models/        # Downloaded model weights
+├── 本地翻译版本/              # Offline translation variant
+├── video_dubbing.py          # Main dubbing pipeline
+├── speaker_aware_dubbing.py  # Speaker analysis module
+├── gender_classifier.py      # Gender classification module
+├── test_diarization.py       # Diarization test script
+└── video_subtitles_only.py   # Subtitle-only script
 ```
+
+## Model Downloads
+
+First run will automatically download:
+- `pyannote/speaker-diarization-community-1` (diarization)
+- `JaesungHuh/ecapa-gender` (gender classification)
+- `speechbrain/spkrec-ecapa-voxceleb` (speaker embeddings)
+
+Note: pyannote models require accepting user conditions on HuggingFace.

@@ -1,28 +1,45 @@
 # 视频翻译配音工具依赖
 
-# ASR 语音识别
+# ============ ASR 语音识别 ============
 faster-whisper
 torch
 onnxruntime
 
+# ============ 翻译 ============
 # 在线翻译
 deep_translator
-
-# 视频处理
-moviepy
-Pillow
-
-# 配音合成
-TTS
 
 # 离线翻译（可选，用于本地翻译版本）
 transformers
 sentencepiece
 
-# 说话人分离和性别识别
+# ============ 视频处理 ============
+moviepy
+Pillow
+
+# ============ 配音合成 ============
+TTS
+
+# ============ 说话人分离（需要 HF_TOKEN）============
 pyannote.audio
 librosa
 scipy
 soundfile
-# 开源性别识别（推荐，提高准确率）
+
+# ============ 性别识别 ============
+# ECAPA-TDNN 性别分类模型 + 说话人 embedding
 speechbrain
+huggingface_hub
+
+# ============ 额外说明 ============
+# 1. pyannote 模型需要 HuggingFace Token：
+#    - 访问 https://huggingface.co/pyannote/speaker-diarization-community-1 同意协议
+#    - 访问 https://huggingface.co/pyannote/segmentation-3.0 同意协议
+#    - 设置环境变量 HF_TOKEN
+#
+# 2. 性别分类模型需要克隆：
+#    git clone https://github.com/JaesungHuh/voice-gender-classifier.git
+#
+# 3. Windows 下 soundfile 如报 libsndfile 错误：
+#    pip uninstall soundfile -y
+#    pip install soundfile --force-reinstall
