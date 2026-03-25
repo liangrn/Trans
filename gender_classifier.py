@@ -54,6 +54,34 @@ class GenderClassifier:
         except ImportError:
             return "cpu"
 
+    @staticmethod
+    def _patch_hf_hub():
+        """修复 speechbrain 与新版 huggingface_hub 的兼容性问题
+        新版 hub 废弃了 use_auth_token 参数，改为 token"""
+        try:
+            import huggingface_hub
+            _orig = huggingface_hub.hf_hub_download
+            def _patched(*args, **kwargs):
+                if 'use_auth_token' in kwargs:
+                    kwargs['token'] = kwargs.pop('use_auth_token')
+                return _orig(*args, **kwargs)
+            huggingface_hub.hf_hub_download = _patched
+            # 同时 patch speechbrain 内部各模块的引用
+            for _mod_name in [
+                'speechbrain.utils.fetching',
+                'speechbrain.utils.parameter_transfer',
+                'speechbrain.pretrained.fetching',
+            ]:
+                try:
+                    import importlib
+                    _mod = importlib.import_module(_mod_name)
+                    if hasattr(_mod, 'hf_hub_download'):
+                        _mod.hf_hub_download = _patched
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def load_models(self) -> bool:
         """加载所有模型，幂等"""
         if self._model_ready is not None:
@@ -62,12 +90,21 @@ class GenderClassifier:
         try:
             import torch
             import torch.nn as nn
+
+            # 在加载任何 speechbrain 模型前先打补丁
+            self._patch_hf_hub()
+
             from speechbrain.inference.classifiers import EncoderClassifier
 
             print(f"  [模型] 加载 ECAPA embedding ({self.device})...")
+            # 预创建 custom.py 占位文件，避免新版仓库结构变化导致 404
+            import pathlib
+            _savedir = pathlib.Path("pretrained_models/spkrec-ecapa-voxceleb")
+            _savedir.mkdir(parents=True, exist_ok=True)
+            (_savedir / "custom.py").write_text("# placeholder\n")
             self._ecapa_model = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir="pretrained_models/spkrec-ecapa-voxceleb",
+                savedir=str(_savedir),
                 run_opts={"device": self.device}
             )
 
@@ -135,24 +172,14 @@ class GenderClassifier:
 
         try:
             if self._use_full_model and self._gender_model is not None:
-                # 直接传 waveform，不写临时文件
-                import tempfile, soundfile as sf, os as _os
+                import tempfile, soundfile as sf, os
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp_path = tmp.name
                 sf.write(tmp_path, waveform, Config.SAMPLE_RATE)
-                try:
-                    with torch.no_grad():
-                        result = self._gender_model.predict(tmp_path, torch.device(self.device))
-                finally:
-                    _os.unlink(tmp_path)
-                # 解析输出：result 可能是字符串 "female"/"male" 或包含该词的对象
-                result_str = str(result).lower()
-                if "female" in result_str:
-                    gender = "female"
-                elif "male" in result_str:
-                    gender = "male"
-                else:
-                    gender = "female"  # 默认
+                with torch.no_grad():
+                    result = self._gender_model.predict(tmp_path, torch.device(self.device))
+                os.unlink(tmp_path)
+                gender = "female" if "female" in str(result).lower() else "male"
                 return gender, 0.90
 
             elif self._ecapa_model is not None and self._gender_head is not None:
