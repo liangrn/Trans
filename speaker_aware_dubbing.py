@@ -47,6 +47,9 @@ class Config:
     # Embedding 并行线程数
     EMBEDDING_WORKERS = 4
 
+    # 是否对每个片段独立判断性别（True=不投票聚合，解决同一 speaker 内性别不一致问题）
+    PER_SEGMENT_GENDER = True
+
     HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 
@@ -187,26 +190,86 @@ def get_voice_for_segment(
     seg_end: float,
     speaker_map: Dict[str, Dict],
     speaker_voice_map: Dict[str, str],
-    fallback_voice_key: str
+    fallback_voice_key: str,
+    available_voices: Dict = None,
+    target_lang: str = "en"
 ) -> str:
-    """找与该 ASR 片段时间重叠最多的说话人，返回其 voice_key"""
-    if not speaker_map or not speaker_voice_map:
+    """
+    找与该 ASR 片段时间重叠最多的说话人片段，返回其 voice_key
+
+    如果启用了 per_segment 模式，会根据片段的性别选择对应声音
+    """
+    if not speaker_map:
         return fallback_voice_key
 
     best_speaker = None
+    best_segment_gender = None
     best_overlap = 0.0
 
     for speaker_id, info in speaker_map.items():
-        for diar_start, diar_end in info.get("segments", []):
-            overlap = max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = speaker_id
+        # 检查是否有按片段的性别信息
+        segment_genders = info.get("segment_genders")
+
+        if segment_genders:
+            # 按片段匹配
+            for seg_info in segment_genders:
+                diar_start, diar_end = seg_info["start"], seg_info["end"]
+                overlap = max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_speaker = speaker_id
+                    best_segment_gender = seg_info["gender"]
+        else:
+            # 原逻辑：按说话人匹配
+            for diar_start, diar_end in info.get("segments", []):
+                overlap = max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_speaker = speaker_id
 
     if best_speaker is None or best_overlap < 0.15:
         return fallback_voice_key
 
+    # 如果有片段级别的性别信息，根据性别选择声音
+    if best_segment_gender and best_segment_gender != "unknown" and available_voices:
+        return _get_voice_by_gender(best_segment_gender, target_lang, available_voices, fallback_voice_key)
+
     return speaker_voice_map.get(best_speaker, fallback_voice_key)
+
+
+def _get_voice_by_gender(
+    gender: str,
+    target_lang: str,
+    available_voices: Dict,
+    fallback_voice_key: str
+) -> str:
+    """根据性别和语言选择合适的声音"""
+    lang_prefix = {
+        "en": "en", "ja": "ja", "ko": "ko", "id": "id",
+        "vi": "vi", "es": "es", "tr": "tr", "pt": "pt",
+        "hi": "hi", "ar": "ar", "th": "th", "fr": "fr",
+        "de": "de", "it": "it", "zh": "zh", "ru": "ru",
+    }.get(target_lang.lower(), "en")
+
+    if gender == "male":
+        voices = sorted([
+            k for k in available_voices
+            if k.startswith(lang_prefix) and ("_m0" in k or "_male_" in k)
+        ])
+    else:  # female
+        voices = sorted([
+            k for k in available_voices
+            if k.startswith(lang_prefix) and ("_f0" in k or "_female_" in k)
+        ])
+
+    # 如果没有对应语言的声音，使用英文
+    if not voices:
+        if gender == "male":
+            voices = sorted([k for k in available_voices if "_vctk_vits_m" in k])
+        else:
+            voices = sorted([k for k in available_voices if "_vctk_vits_f" in k])
+
+    return voices[0] if voices else fallback_voice_key
 
 
 # =====================================================================
@@ -367,13 +430,14 @@ def _identify_genders_parallel(
 ) -> Dict[str, Dict]:
     """
     性别识别 —— 多线程并行版
-    逻辑与 test_diarization.py identify_genders() 完全相同，
-    只是各说话人改为并行处理。
     注意：GenderClassifier 是单例，模型只加载一次，线程安全（只读推理）。
     """
     from gender_classifier import GenderClassifier, Config as GC
 
-    print("[说话人识别] 性别识别（并行）...")
+    per_segment = Config.PER_SEGMENT_GENDER
+    mode_str = "（按片段）" if per_segment else "（按说话人投票）"
+    print(f"[说话人识别] 性别识别{mode_str}（并行）...")
+
     # 预先加载模型，避免多线程竞争初始化
     classifier = GenderClassifier()
     classifier.load_models()
@@ -382,20 +446,43 @@ def _identify_genders_parallel(
         total_duration = sum(e - s for s, e in segments)
         valid_count = sum(1 for s, e in segments if e - s >= GC.MIN_DURATION)
 
-        gender, confidence, details = classifier.classify_speaker_segments(
-            waveform, sr, segments, speaker_id=speaker
-        )
-        if confidence < Config.GENDER_CONF_THRESHOLD:
-            gender = "unknown"
+        if per_segment:
+            # 每个片段独立判断
+            segment_results = classifier.classify_each_segment(
+                waveform, sr, segments, speaker_id=speaker
+            )
+            # 统计投票
+            votes = {"male": 0, "female": 0, "unknown": 0}
+            for seg_info in segment_results:
+                votes[seg_info["gender"]] += 1
+            main_gender = max(votes, key=votes.get)
+            confidence = votes[main_gender] / len(segment_results) if segment_results else 0
 
-        return speaker, {
-            "gender": gender,
-            "confidence": confidence,
-            "segments": segments,
-            "total_duration": total_duration,
-            "segment_count": len(segments),
-            "details": details,
-        }
+            return speaker, {
+                "gender": main_gender,
+                "confidence": confidence,
+                "segments": segments,
+                "segment_genders": segment_results,  # 每个片段的性别
+                "total_duration": total_duration,
+                "segment_count": len(segments),
+                "details": {"method": "per_segment", "votes": votes},
+            }
+        else:
+            # 按说话人投票聚合
+            gender, confidence, details = classifier.classify_speaker_segments(
+                waveform, sr, segments, speaker_id=speaker
+            )
+            if confidence < Config.GENDER_CONF_THRESHOLD:
+                gender = "unknown"
+
+            return speaker, {
+                "gender": gender,
+                "confidence": confidence,
+                "segments": segments,
+                "total_duration": total_duration,
+                "segment_count": len(segments),
+                "details": details,
+            }
 
     speaker_info = {}
     n_speakers = len(speaker_segments)
@@ -411,9 +498,16 @@ def _identify_genders_parallel(
         for future in as_completed(futures):
             try:
                 speaker, info = future.result()
-                gz = {"male": "男", "female": "女", "unknown": "未知"}[info["gender"]]
-                print(f"  {speaker}: {gz} (置信度={info['confidence']:.2f}, "
-                      f"方法={info['details'].get('method', '?')})")
+                if info.get("segment_genders"):
+                    # 按片段模式
+                    votes = info["details"].get("votes", {})
+                    print(f"  {speaker}: 男={votes.get('male',0)} 女={votes.get('female',0)} "
+                          f"未知={votes.get('unknown',0)}")
+                else:
+                    # 按说话人投票模式
+                    gz = {"male": "男", "female": "女", "unknown": "未知"}[info["gender"]]
+                    print(f"  {speaker}: {gz} (置信度={info['confidence']:.2f}, "
+                          f"方法={info['details'].get('method', '?')})")
                 speaker_info[speaker] = info
             except Exception as e:
                 sp = futures[future]

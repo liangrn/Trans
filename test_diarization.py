@@ -162,14 +162,22 @@ def parse_diarization(diarization) -> Dict[str, List[Tuple[float, float]]]:
 def identify_genders(
     waveform: np.ndarray,
     sr: int,
-    speaker_segments: Dict[str, List[Tuple[float, float]]]
+    speaker_segments: Dict[str, List[Tuple[float, float]]],
+    per_segment: bool = False
 ) -> Dict[str, Dict]:
     """
     性别识别：传入已加载的 waveform，避免重复 IO
+
+    Args:
+        waveform: 音频波形
+        sr: 采样率
+        speaker_segments: {speaker: [(start, end), ...]}
+        per_segment: 是否对每个片段独立判断性别（True=不投票聚合）
     """
     from gender_classifier import GenderClassifier, Config as GC
 
-    print("\n[4/5] 性别识别...")
+    mode_str = "（按片段）" if per_segment else "（按说话人投票）"
+    print(f"\n[4/5] 性别识别{mode_str}...")
     classifier = GenderClassifier()
 
     speaker_info = {}
@@ -179,24 +187,53 @@ def identify_genders(
         print(f"\n  {speaker} ({total_duration:.1f}s, {len(segments)} 段, "
               f"有效 {valid_count} 段):")
 
-        gender, confidence, details = classifier.classify_speaker_segments(
-            waveform, sr, segments, speaker_id=speaker
-        )
+        if per_segment:
+            # 每个片段独立判断
+            segment_results = classifier.classify_each_segment(
+                waveform, sr, segments, speaker_id=speaker
+            )
 
-        if confidence < Config.GENDER_CONF_THRESHOLD:
-            gender = "unknown"
+            # 统计投票（用于显示）
+            votes = {"male": 0, "female": 0, "unknown": 0}
+            for seg_info in segment_results:
+                votes[seg_info["gender"]] += 1
 
-        gender_zh = {"male": "男", "female": "女", "unknown": "未知"}[gender]
-        print(f"  → {gender_zh} (置信度={confidence:.2f}, 方法={details.get('method', '?')})")
+            # 主性别（多数投票）
+            main_gender = max(votes, key=votes.get)
+            confidence = votes[main_gender] / len(segment_results) if segment_results else 0
 
-        speaker_info[speaker] = {
-            "gender": gender,
-            "confidence": confidence,
-            "segments": segments,
-            "total_duration": total_duration,
-            "segment_count": len(segments),
-            "details": details,
-        }
+            gender_zh = {"male": "男", "female": "女", "unknown": "未知"}[main_gender]
+            print(f"  → 主性别: {gender_zh} (male={votes['male']}, female={votes['female']}, unknown={votes['unknown']})")
+
+            speaker_info[speaker] = {
+                "gender": main_gender,
+                "confidence": confidence,
+                "segments": segments,
+                "segment_genders": segment_results,  # 新增：每个片段的性别
+                "total_duration": total_duration,
+                "segment_count": len(segments),
+                "details": {"method": "per_segment", "votes": votes},
+            }
+        else:
+            # 按说话人投票聚合（原逻辑）
+            gender, confidence, details = classifier.classify_speaker_segments(
+                waveform, sr, segments, speaker_id=speaker
+            )
+
+            if confidence < Config.GENDER_CONF_THRESHOLD:
+                gender = "unknown"
+
+            gender_zh = {"male": "男", "female": "女", "unknown": "未知"}[gender]
+            print(f"  → {gender_zh} (置信度={confidence:.2f}, 方法={details.get('method', '?')})")
+
+            speaker_info[speaker] = {
+                "gender": gender,
+                "confidence": confidence,
+                "segments": segments,
+                "total_duration": total_duration,
+                "segment_count": len(segments),
+                "details": details,
+            }
 
     return speaker_info
 
@@ -320,10 +357,21 @@ def print_results(speaker_info: Dict[str, Dict],
 
     all_segs = []
     for sp, info in speaker_info.items():
-        g = info.get("gender", "unknown")
-        for start, end in info.get("segments", []):
-            if end - start >= min_display_duration:
-                all_segs.append((start, end, sp, g))
+        # 检查是否有按片段的性别信息
+        segment_genders = info.get("segment_genders")
+
+        if segment_genders:
+            # 按片段性别显示
+            for seg_info in segment_genders:
+                start, end = seg_info["start"], seg_info["end"]
+                if end - start >= min_display_duration:
+                    all_segs.append((start, end, sp, seg_info["gender"]))
+        else:
+            # 原逻辑：按说话人性别显示
+            g = info.get("gender", "unknown")
+            for start, end in info.get("segments", []):
+                if end - start >= min_display_duration:
+                    all_segs.append((start, end, sp, g))
     all_segs.sort()
 
     for start, end, sp, g in all_segs:
@@ -360,6 +408,8 @@ def main():
                              "同一人被分多人→调大，不同人被合并→调小")
     parser.add_argument("--min-display-duration", type=float, default=1.0,
                         help="时间线最小显示时长(秒)，默认=1.0，设0显示全部")
+    parser.add_argument("--per-segment", action="store_true",
+                        help="对每个片段独立判断性别（不投票聚合）")
     args = parser.parse_args()
 
     if not os.path.exists(args.video):
@@ -408,7 +458,8 @@ def main():
             sys.exit(1)
 
         # 4. 性别识别（传入已加载的 waveform）
-        speaker_info = identify_genders(waveform, sr, speaker_segments)
+        speaker_info = identify_genders(waveform, sr, speaker_segments,
+                                        per_segment=args.per_segment)
 
         # 5. 说话人合并（复用已加载的 ECAPA 模型）
         print("\n[5/5] 后处理...")

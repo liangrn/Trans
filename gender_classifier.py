@@ -203,6 +203,73 @@ class GenderClassifier:
 
         return None, 0.0
 
+    def classify_each_segment(
+        self,
+        waveform_full: np.ndarray,
+        sr: int,
+        segments: List[Tuple[float, float]],
+        speaker_id: str = ""
+    ) -> List[Dict]:
+        """
+        对每个片段独立判断性别（不投票聚合）
+
+        Returns:
+            [{"start": float, "end": float, "gender": str, "confidence": float}, ...]
+        """
+        import librosa
+
+        prefix = f"[{speaker_id}]" if speaker_id else "[]"
+        results = []
+
+        model_ok = self.load_models()
+
+        for start, end in segments:
+            duration = end - start
+            if duration < Config.MIN_DURATION:
+                results.append({
+                    "start": start, "end": end,
+                    "gender": "unknown", "confidence": 0.0
+                })
+                continue
+
+            seg = waveform_full[int(start * sr):int(end * sr)]
+            if sr != Config.SAMPLE_RATE:
+                seg = librosa.resample(seg, orig_sr=sr, target_sr=Config.SAMPLE_RATE)
+
+            gender, confidence = None, 0.0
+            if model_ok:
+                gender, confidence = self._predict_one(seg)
+
+            if not gender:
+                # F0 fallback
+                gender, confidence = self._classify_segment_by_f0(seg, sr)
+
+            results.append({
+                "start": start,
+                "end": end,
+                "gender": gender or "unknown",
+                "confidence": confidence
+            })
+
+        return results
+
+    def _classify_segment_by_f0(self, waveform: np.ndarray, sr: int) -> Tuple[str, float]:
+        """单片段 F0 分类"""
+        import librosa
+        try:
+            f0, _, vp = librosa.pyin(waveform, fmin=60, fmax=500, sr=sr, fill_na=np.nan)
+            valid = f0[~np.isnan(f0) & (vp > 0.4)]
+            if len(valid) >= 5:
+                p25 = float(np.percentile(valid, 25))
+                if p25 < 155:
+                    return "male", 0.70
+                elif p25 > 195:
+                    return "female", 0.70
+                return "male" if p25 < 175 else "female", 0.55
+        except Exception:
+            pass
+        return "unknown", 0.0
+
     def classify_speaker_segments(
         self,
         waveform_full: np.ndarray,
@@ -211,7 +278,7 @@ class GenderClassifier:
         speaker_id: str = ""
     ) -> Tuple[str, float, Dict]:
         """
-        对同一说话人多段音频做性别识别
+        对同一说话人多段音频做性别识别（投票聚合）
 
         Args:
             waveform_full: 完整音频（避免重复 IO）

@@ -1266,7 +1266,9 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             for seg in translated_segments_data:
                 seg['_voice_key'] = get_voice_for_segment(
                     seg['start'], seg['end'],
-                    speaker_map, speaker_voice_map, selected_voice_key
+                    speaker_map, speaker_voice_map, selected_voice_key,
+                    available_voices=available_voices,
+                    target_lang=target_language
                 )
             # 按 voice_key 分组，每组用自己的 TTS 模型生成
             tts_results, tts_temp_files = _generate_tts_multi_voice(
