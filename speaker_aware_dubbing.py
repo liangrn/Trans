@@ -364,7 +364,8 @@ def _perform_diarization(audio_path: str, token: str):
     import torch, librosa
 
     print(f"[说话人识别] 运行分离 (模型: {Config.DIARIZATION_MODEL})...")
-    pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, token=token)
+    #pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, token=token)
+    pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, use_auth_token=token)
 
     try:
         if torch.cuda.is_available():
