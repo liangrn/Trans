@@ -56,3 +56,14 @@ def test_gender_model_loading_is_cwd_independent_and_repo_consistent():
     assert 'JaesungHuh/ecapa-gender' not in text
     assert 'filename="model.pt"' not in text
     assert 'sys.path.insert(0, "voice-gender-classifier")' not in text
+
+
+def test_windows_install_script_has_preflight_logging_and_post_checks():
+    source = Path(__file__).resolve().parents[1] / "install_windows.bat"
+    text = source.read_text(encoding="utf-8")
+
+    assert "set LOG_FILE=%~dp0install_windows.log" in text
+    assert "call :check_required_file \"voice-gender-classifier\\model.py\"" in text
+    assert "call :run_pip_install" in text
+    assert "HF_TOKEN is not set" in text
+    assert "python video_dubbing.py --help" in text

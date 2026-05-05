@@ -56,12 +56,15 @@ install_windows.bat
 
 脚本会完成：
 
-1. 创建 `trans_env` 虚拟环境
-2. 固定安装 `numpy<2`
-3. 从 `https://download.pytorch.org/whl/cpu` 安装 CPU 版 `torch/torchaudio/torchvision`
-4. 安装 `onnxruntime`
-5. 安装 `coqui-tts` 与其余依赖
-6. 验证关键模块可导入
+1. 检查部署目录关键文件是否齐全
+2. 创建 `trans_env` 虚拟环境
+3. 固定安装 `numpy<2`
+4. 从 `https://download.pytorch.org/whl/cpu` 安装 CPU 版 `torch/torchaudio/torchvision`
+5. 安装 `onnxruntime`
+6. 安装 `coqui-tts` 与其余依赖
+7. 验证关键模块可导入，并检查主脚本 `--help`
+
+脚本会在项目根目录生成 `install_windows.log`。安装失败时，优先查看这个日志。
 
 ### 3.3 Windows 额外要求
 

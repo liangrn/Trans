@@ -49,9 +49,12 @@
 
 脚本会自动完成：
 1. 检测 Python 版本
-2. 创建独立虚拟环境并选择 CPU-only torch wheel
-3. 按正确顺序安装所有依赖（numpy 版本锁定、torch 专用源）
-4. 验证每个关键包是否能正常导入
+2. 检查部署包是否完整（包括 `voice-gender-classifier/model.py`）
+3. 创建独立虚拟环境并选择 CPU-only torch wheel
+4. 按正确顺序安装所有依赖（numpy 版本锁定、torch 专用源）
+5. 验证每个关键包是否能正常导入，并检查 `video_dubbing.py --help`
+
+脚本会在项目根目录生成 `install_windows.log`。安装失败时先看这个日志，不要只看命令行最后一行。
 
 > **注意**：CPU 版 torch 下载仍可能较慢，请耐心等待。如下载超时，可在脚本运行前设置代理或使用国内镜像（脚本内有说明）。
 
