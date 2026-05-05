@@ -1,45 +1,61 @@
 # 视频翻译配音工具依赖
+# ============================================================
+# 版本锁定说明：
+#   - torch 锁定 2.3.x：同时满足 faster-whisper>=1.0、pyannote.audio>=3.1、
+#     以及 speechbrain 对 torch 的要求。
+#   - TTS 改用 coqui-tts（社区维护 fork），已发布支持 torch 2.x 的 wheel，
+#     Windows 无需本地编译 C 扩展。
+#   - numpy 锁定 <2.0：numpy 2.x 破坏大量 C-API 扩展的 ABI（torch / speechbrain
+#     / onnxruntime），必须固定在 1.x。
+#   - moviepy 锁定 1.0.3：2.0 删除了 moviepy.editor 模块，代码使用的是 1.x API。
+#   - soundfile 锁定 0.12.x：Windows 上该版本携带预编译 libsndfile DLL，
+#     无需手动安装。
+# ============================================================
+
+# ============ 核心深度学习框架 ============
+# torch 2.3.x 是同时满足 faster-whisper 1.x / pyannote.audio 3.1 / speechbrain 的最低公共版本
+torch>=2.3.0,<2.4.0
+torchaudio>=2.3.0,<2.4.0
 
 # ============ ASR 语音识别 ============
-faster-whisper
-torch
-onnxruntime
+faster-whisper>=1.0.0,<2.0.0
+# CPU-only ASR runtime for simpler Windows setup
+onnxruntime>=1.17.0,<2.0.0
+
+# ============ torchvision（链式依赖锁定，防止拉到与 torch 不匹配的版本）============
+# torch 2.3.x 严格对应 torchvision 0.18.x；版本不匹配会导致 torchvision::nms 不存在
+torchvision>=0.18.0,<0.19.0
 
 # ============ 翻译 ============
-# 在线翻译
-deep_translator
+deep_translator>=1.11.0,<2.0.0
 
-# 离线翻译（可选，用于本地翻译版本）
-transformers
-sentencepiece
+# ============ Coqui TTS 运行依赖 ============
+transformers>=4.40.0,<5.0.0  # MUST be <5.0: transformers 5.x removed
+                              # isin_mps_friendly used by coqui-tts at import
 
 # ============ 视频处理 ============
-moviepy
-Pillow
+# MoviePy 1.x API（2.0 删除了 moviepy.editor，不兼容现有代码）
+moviepy==1.0.3
+imageio>=2.9.0,<3.0.0
+imageio-ffmpeg>=0.4.9
+Pillow>=9.0.0,<11.0.0
 
 # ============ 配音合成 ============
-TTS
+# coqui-tts：Coqui TTS 的社区维护 fork，支持 torch 2.x，Windows 有预编译 wheel
+coqui-tts>=0.24.0,<1.0.0
 
 # ============ 说话人分离（需要 HF_TOKEN）============
-pyannote.audio
-librosa
-scipy
-soundfile
+pyannote.audio>=3.3.0,<4.0.0
+librosa>=0.10.0,<1.0.0
+scipy>=1.11.0,<2.0.0
+soundfile>=0.12.0,<0.13.0
+
+# ============ numpy：必须锁定在 1.x ============
+numpy>=1.24.0,<2.0.0
 
 # ============ 性别识别 ============
-# ECAPA-TDNN 性别分类模型 + 说话人 embedding
-speechbrain
-huggingface_hub
+speechbrain>=1.0.0,<2.0.0
+huggingface_hub>=0.23.0,<2.0.0
 
-# ============ 额外说明 ============
-# 1. pyannote 模型需要 HuggingFace Token：
-#    - 访问 https://huggingface.co/pyannote/speaker-diarization-community-1 同意协议
-#    - 访问 https://huggingface.co/pyannote/segmentation-3.0 同意协议
-#    - 设置环境变量 HF_TOKEN
-#
-# 2. 性别分类模型需要克隆：
-#    git clone https://github.com/JaesungHuh/voice-gender-classifier.git
-#
-# 3. Windows 下 soundfile 如报 libsndfile 错误：
-#    pip uninstall soundfile -y
-#    pip install soundfile --force-reinstall
+# ============ 繁体中文转换（可选但推荐）============
+zhconv>=1.4.3

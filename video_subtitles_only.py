@@ -9,7 +9,14 @@ from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 from PIL import Image, ImageDraw, ImageFont
 import warnings
-from moviepy.editor import VideoFileClip, CompositeVideoClip
+try:
+    from moviepy.editor import VideoFileClip, CompositeVideoClip
+except ImportError as _mpy_err:
+    raise ImportError(
+        f"MoviePy 1.x 导入失败: {_mpy_err}\n"
+        "请确认已安装 moviepy==1.0.3（MoviePy 2.x 已移除 moviepy.editor 模块）。\n"
+        "修复命令: pip install moviepy==1.0.3"
+    )
 import torch
 import sys
 import glob
@@ -23,6 +30,48 @@ warnings.filterwarnings("ignore", message="You are sending unauthenticated reque
 
 # 配置：可通过环境变量覆盖字幕字体路径
 FONT_PATH_OVERRIDE = os.environ.get('SUBTITLE_FONT_PATH', None)
+
+def _resolve_ffmpeg_bin() -> str:
+    """解析 ffmpeg 路径：环境变量 > PATH > imageio-ffmpeg 捆绑二进制"""
+    import shutil as _shutil
+    env_bin = os.environ.get('FFMPEG_BIN', '').strip()
+    if env_bin:
+        return env_bin
+    if _shutil.which('ffmpeg'):
+        return 'ffmpeg'
+    try:
+        import imageio_ffmpeg
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.isfile(bundled):
+            return bundled
+    except Exception:
+        pass
+    return 'ffmpeg'
+
+FFMPEG_BIN = _resolve_ffmpeg_bin()
+
+# ===== 注入 FFMPEG_BIN 到 moviepy 1.x 配置 =====
+# moviepy 1.x 通过 moviepy.config.FFMPEG_BINARY 决定调用哪个 ffmpeg，
+# write_videofile 不接受 ffmpeg_exe 参数，必须在此处覆盖配置。
+try:
+    import moviepy.config as _mpy_cfg
+    _mpy_cfg.FFMPEG_BINARY = FFMPEG_BIN
+except Exception:
+    pass
+
+def _safe_remove(path: str, retries: int = 5, delay: float = 0.15) -> None:
+    """安全删除临时文件，规避 Windows 文件句柄延迟释放的 PermissionError。"""
+    import time as _time
+    for attempt in range(retries):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            if attempt < retries - 1:
+                _time.sleep(delay)
+        except OSError:
+            return
 
 def get_available_fonts():
     """获取系统字体目录列表（用于调试字体加载）"""
@@ -135,7 +184,20 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         return ImageFont.load_default()
 
     def get_font_for_windows(size):
-        """Windows专用字体加载"""
+        """Windows专用字体加载
+        修复：FONT_PATH_OVERRIDE 优先级最高，放在最前检查（原代码优先级逻辑反了）。
+        """
+        # ① 最高优先级：用户通过环境变量或命令行指定的自定义字体
+        if FONT_PATH_OVERRIDE and os.path.exists(FONT_PATH_OVERRIDE):
+            try:
+                print(f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
+                font = ImageFont.truetype(FONT_PATH_OVERRIDE, size=size)
+                print(f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
+                return font
+            except Exception as e:
+                print(f"    - 覆盖字体加载失败（将继续尝试系统字体）: {e}")
+
+        # ② 系统字体目录扫描
         windows_dirs = [
             os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts'),
             'C:\\Windows\\Fonts',
@@ -163,24 +225,13 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
                                 font = ImageFont.truetype(font_path, size=size, index=0)
                             else:
                                 font = ImageFont.truetype(font_path, size=size)
-                            # 测试字体
-                            test_text = "Test"
-                            bbox = font.getbbox(test_text)
+                            bbox = font.getbbox("Test")
                             if bbox:
                                 print(f"    - 成功加载: {font_name}")
                                 return font
                         except Exception as e:
                             print(f"    - 加载失败 {font_name}: {e}")
                             continue
-        # 如果用户提供了覆盖字体路径，最后再尝试一次（有些系统字体目录不可读）
-        if FONT_PATH_OVERRIDE and os.path.exists(FONT_PATH_OVERRIDE):
-            try:
-                print(f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
-                font = ImageFont.truetype(FONT_PATH_OVERRIDE, size=size)
-                print(f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
-                return font
-            except Exception as e:
-                print(f"    - 覆盖字体加载失败: {e}")
         print("    - 使用PIL默认字体")
         return ImageFont.load_default()
 
@@ -489,7 +540,7 @@ def get_video_stream_info(video_path):
             '-select_streams', 'v:0',
             video_path
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
         if result.returncode != 0:
             return None
             
@@ -568,7 +619,7 @@ def merge_videos_ffmpeg_safe(video_files, output_path):
     try:
         # FFmpeg合并命令（无损复制）
         cmd = [
-            'ffmpeg',
+            FFMPEG_BIN,
             '-f', 'concat',
             '-safe', '0',
             '-i', filelist_path,
@@ -621,7 +672,7 @@ def merge_videos_ffmpeg_safe(video_files, output_path):
         time.sleep(0.1)
         if os.path.exists(filelist_path):
             try:
-                os.remove(filelist_path)
+                _safe_remove(filelist_path)
             except:
                 pass
 
@@ -721,8 +772,8 @@ def process_single_video(input_video_path, target_language, output_video_path, p
         # ========== 1. 语音识别 (ASR) ==========
         print("\n[1/3] 语音识别 (ASR)...")
         model_size = "medium"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "float32"
+        device = "cpu"
+        compute_type = "float32"
         
         try:
             model = WhisperModel(model_size, device=device, compute_type=compute_type)
@@ -910,7 +961,7 @@ def process_single_video(input_video_path, target_language, output_video_path, p
             for temp_path in temp_files_to_delete:
                 try:
                     if os.path.exists(temp_path):
-                        os.remove(temp_path)
+                        _safe_remove(temp_path)
                 except:
                     pass
             

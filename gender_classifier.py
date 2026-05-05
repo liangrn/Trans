@@ -12,9 +12,26 @@
 import os
 import warnings
 from typing import Tuple, Dict, List, Optional
+from pathlib import Path
+import importlib.util
 import numpy as np
 
 warnings.filterwarnings("ignore")
+
+
+def _safe_remove(path: str, retries: int = 5, delay: float = 0.15) -> None:
+    """安全删除临时文件，规避 Windows 文件句柄延迟释放的 PermissionError。"""
+    import time as _time
+    for attempt in range(retries):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            if attempt < retries - 1:
+                _time.sleep(delay)
+        except OSError:
+            return
 
 
 class Config:
@@ -48,25 +65,52 @@ class GenderClassifier:
         self._model_ready = None
 
     def _detect_device(self) -> str:
-        try:
-            import torch
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            return "cpu"
+        return "cpu"
+
+    @staticmethod
+    def _load_local_ecapa_gender_class():
+        """Load the bundled voice-gender-classifier by absolute path, independent of cwd."""
+        project_root = Path(__file__).resolve().parent
+        model_path = project_root / "voice-gender-classifier" / "model.py"
+        if not model_path.is_file():
+            raise FileNotFoundError(f"本地性别模型文件不存在: {model_path}")
+
+        spec = importlib.util.spec_from_file_location("voice_gender_classifier_model", model_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"无法为本地性别模型创建导入 spec: {model_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "ECAPA_gender"):
+            raise ImportError(f"本地性别模型缺少 ECAPA_gender: {model_path}")
+        return module.ECAPA_gender
 
     @staticmethod
     def _patch_hf_hub():
-        """修复 speechbrain 与新版 huggingface_hub 的兼容性问题
-        新版 hub 废弃了 use_auth_token 参数，改为 token"""
+        """修复 speechbrain / pyannote 与新版 huggingface_hub 的兼容性问题。
+        hf_hub 0.20+ 将 use_auth_token 参数重命名为 token，旧参数直接抛 TypeError。
+        本补丁对 hf_hub_download 以及 snapshot_download 同时生效，并向下传播到
+        speechbrain 内部模块的局部引用。"""
         try:
             import huggingface_hub
-            _orig = huggingface_hub.hf_hub_download
-            def _patched(*args, **kwargs):
-                if 'use_auth_token' in kwargs:
-                    kwargs['token'] = kwargs.pop('use_auth_token')
-                return _orig(*args, **kwargs)
-            huggingface_hub.hf_hub_download = _patched
-            # 同时 patch speechbrain 内部各模块的引用
+
+            def _make_patched(orig_fn):
+                def _patched(*args, **kwargs):
+                    if 'use_auth_token' in kwargs:
+                        token_val = kwargs.pop('use_auth_token')
+                        # 仅在未显式传入 token 时才写入，避免覆盖调用方的有效 token
+                        if 'token' not in kwargs:
+                            kwargs['token'] = token_val
+                    return orig_fn(*args, **kwargs)
+                return _patched
+
+            # patch 顶层函数
+            for _fn_name in ('hf_hub_download', 'snapshot_download'):
+                if hasattr(huggingface_hub, _fn_name):
+                    setattr(huggingface_hub, _fn_name,
+                            _make_patched(getattr(huggingface_hub, _fn_name)))
+
+            # 同时 patch speechbrain 内部各模块的局部引用
             for _mod_name in [
                 'speechbrain.utils.fetching',
                 'speechbrain.utils.parameter_transfer',
@@ -75,8 +119,10 @@ class GenderClassifier:
                 try:
                     import importlib
                     _mod = importlib.import_module(_mod_name)
-                    if hasattr(_mod, 'hf_hub_download'):
-                        _mod.hf_hub_download = _patched
+                    for _fn_name in ('hf_hub_download', 'snapshot_download'):
+                        if hasattr(_mod, _fn_name):
+                            setattr(_mod, _fn_name,
+                                    _make_patched(getattr(_mod, _fn_name)))
                 except Exception:
                     pass
         except Exception:
@@ -89,8 +135,6 @@ class GenderClassifier:
 
         try:
             import torch
-            import torch.nn as nn
-
             # 在加载任何 speechbrain 模型前先打补丁
             self._patch_hf_hub()
 
@@ -109,36 +153,18 @@ class GenderClassifier:
             )
 
             # 尝试加载专用性别分类模型
-            import sys
-            sys.path.insert(0, "voice-gender-classifier")
             try:
-                from model import ECAPA_gender
+                ECAPA_gender = self._load_local_ecapa_gender_class()
                 print(f"  [模型] 加载 ECAPA-gender 分类模型...")
-                self._gender_model = ECAPA_gender.from_pretrained("JaesungHuh/ecapa-gender")
+                self._gender_model = ECAPA_gender.from_pretrained(
+                    "JaesungHuh/voice-gender-classifier"
+                )
                 self._gender_model.eval()
                 self._gender_model.to(torch.device(self.device))
                 self._use_full_model = True
                 print(f"  [模型] ECAPA-gender 加载成功 ✓")
             except Exception as e1:
-                print(f"  [模型] 完整模型失败({e1})，尝试分类头...")
-                try:
-                    from huggingface_hub import hf_hub_download
-                    model_path = hf_hub_download(
-                        repo_id="JaesungHuh/ecapa-gender",
-                        filename="model.pt"
-                    )
-                    state = torch.load(model_path, map_location=self.device)
-                    self._gender_head = nn.Linear(192, 2).to(self.device)
-                    if isinstance(state, dict) and 'weight' in state:
-                        self._gender_head.load_state_dict(state)
-                    else:
-                        vals = list(state.values())
-                        self._gender_head.weight = nn.Parameter(vals[-2].to(self.device))
-                        self._gender_head.bias = nn.Parameter(vals[-1].to(self.device))
-                    self._gender_head.eval()
-                    print(f"  [模型] 分类头加载成功 ✓")
-                except Exception as e2:
-                    print(f"  [模型] 分类头失败({e2})，使用 embedding 统计")
+                print(f"  [模型] 完整模型失败({e1})，使用 embedding 统计")
 
             self._model_ready = True
 
@@ -178,7 +204,7 @@ class GenderClassifier:
                 sf.write(tmp_path, waveform, Config.SAMPLE_RATE)
                 with torch.no_grad():
                     result = self._gender_model.predict(tmp_path, torch.device(self.device))
-                os.unlink(tmp_path)
+                _safe_remove(tmp_path)
                 gender = "female" if "female" in str(result).lower() else "male"
                 return gender, 0.90
 

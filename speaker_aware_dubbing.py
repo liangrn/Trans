@@ -32,7 +32,8 @@ class Config:
     SAMPLE_RATE = 16000
     MIN_SEGMENT_DURATION = 0.5
 
-    DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+    DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+
     CLUSTERING_THRESHOLD = 0.45
     MIN_DURATION_OFF = 0.1
 
@@ -325,12 +326,46 @@ def _run_full_pipeline(video_path: str, token: str) -> Dict[str, Dict]:
         traceback.print_exc()
         return {}
     finally:
-        if audio_path and os.path.exists(audio_path):
-            os.unlink(audio_path)
+        if audio_path:
+            _safe_remove(audio_path)
+
+
+def _resolve_ffmpeg_bin() -> str:
+    """与 video_dubbing.py 相同的 ffmpeg 路径解析逻辑：
+    环境变量 FFMPEG_BIN > PATH > imageio-ffmpeg 捆绑二进制
+    """
+    import shutil as _shutil
+    env_bin = os.environ.get('FFMPEG_BIN', '').strip()
+    if env_bin:
+        return env_bin
+    if _shutil.which('ffmpeg'):
+        return 'ffmpeg'
+    try:
+        import imageio_ffmpeg
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.isfile(bundled):
+            return bundled
+    except Exception:
+        pass
+    return 'ffmpeg'
+
+def _safe_remove(path: str, retries: int = 5, delay: float = 0.15) -> None:
+    """安全删除，解决 Windows 文件句柄延迟释放的 PermissionError。"""
+    import time as _time
+    for attempt in range(retries):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            if attempt < retries - 1:
+                _time.sleep(delay)
+        except OSError:
+            return
 
 
 def _extract_audio_temp(video_path: str) -> Optional[str]:
-    ffmpeg_bin = os.environ.get("FFMPEG_BIN", "ffmpeg")
+    ffmpeg_bin = _resolve_ffmpeg_bin()
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         audio_path = tmp.name
@@ -348,7 +383,11 @@ def _extract_audio_temp(video_path: str) -> Optional[str]:
                 "-ar", str(Config.SAMPLE_RATE), "-ac", "1",
                 audio_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # encoding='utf-8' 防止 Windows cp936/cp1252 编码问题
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                encoding='utf-8', errors='replace'
+            )
             if result.returncode != 0:
                 print(f"  [错误] ffmpeg: {result.stderr.strip()[-300:]}")
                 return None
@@ -364,15 +403,14 @@ def _perform_diarization(audio_path: str, token: str):
     import torch, librosa
 
     print(f"[说话人识别] 运行分离 (模型: {Config.DIARIZATION_MODEL})...")
-    #pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, token=token)
-    pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, use_auth_token=token)
-
+    # hf_hub 0.20+ 将 use_auth_token 改为 token，优先用新参数，旧版 pyannote 回退
     try:
-        if torch.cuda.is_available():
-            pipeline = pipeline.to(torch.device("cuda"))
-            print("  使用 GPU 加速")
-    except Exception:
-        pass
+        pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, token=token)
+    except TypeError:
+        # 极少数旧版 pyannote (<3.0) 仍只认 use_auth_token
+        pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, use_auth_token=token)
+    pipeline = pipeline.to(torch.device("cpu"))
+    print("  使用 CPU 模式")
 
     try:
         pipeline.instantiate({

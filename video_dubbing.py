@@ -3,34 +3,42 @@ import subprocess
 import os
 import tempfile
 import textwrap
+import sys
+import glob
+import math
+import json
+import warnings
+
+# ===== TTS 导入：优先 coqui-tts（社区 fork），回退到原版 TTS =====
+try:
+    from TTS.api import TTS
+except ImportError:
+    raise ImportError(
+        "TTS 包未安装。请运行: pip install coqui-tts>=0.24.0\n"
+        "coqui-tts 是 Coqui TTS 的社区维护 fork，支持 torch 2.x 且 Windows 有预编译 wheel。"
+    )
+
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
-from TTS.api import TTS
 import torch
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
-#from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips
-#from moviepy.audio.AudioClip import CompositeAudioClip
+
+# ===== MoviePy 1.x 导入（requirements.txt 已锁定 moviepy==1.0.3）=====
+# MoviePy 2.0 删除了 moviepy.editor，本项目使用 1.x API，不支持 2.x。
 try:
     from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips
     from moviepy.audio.AudioClip import CompositeAudioClip
-except ImportError:
-    # 尝试直接导入
-    import moviepy.video.io.VideoFileClip as VideoFileClip
-    import moviepy.audio.io.AudioFileClip as AudioFileClip
-    import moviepy.video.compositing.CompositeVideoClip as CompositeVideoClip
-    import moviepy.video.compositing.concatenate as concatenate_videoclips
-    import moviepy.audio.compositing.CompositeAudioClip as CompositeAudioClip
-from PIL import Image, ImageDraw, ImageFont
-import math
-import sys
-import glob
-import warnings
-warnings.filterwarnings("ignore", message="You are sending unauthenticated requests to the HF Hub")
+except ImportError as _mpy_err:
+    raise ImportError(
+        f"MoviePy 1.x 导入失败: {_mpy_err}\n"
+        "请确认已安装 moviepy==1.0.3（MoviePy 2.x 已移除 moviepy.editor 模块）。\n"
+        "修复命令: pip install moviepy==1.0.3"
+    )
 
-import glob
-import tempfile
-import json
+from PIL import Image, ImageDraw, ImageFont
+
+warnings.filterwarnings("ignore", message="You are sending unauthenticated requests to the HF Hub")
 
 # ===== 说话人感知配音 =====
 try:
@@ -52,11 +60,63 @@ from pathlib import Path
 import shutil
 import time
 
+def _safe_remove(path: str, retries: int = 5, delay: float = 0.15) -> None:
+    """安全删除临时文件，解决 Windows 上文件句柄未释放导致的 PermissionError。
+    Windows 下 MoviePy/GC 可能延迟释放文件句柄，重试+延迟可规避此问题。
+    """
+    import time as _time
+    for attempt in range(retries):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            if attempt < retries - 1:
+                _time.sleep(delay)
+        except OSError:
+            return  # 文件不存在或其他无害错误，直接忽略
+
 # 配置：可通过环境变量或命令行覆盖 ffmpeg 可执行文件与字幕字体路径
-# - 使用环境变量 `FFMPEG_BIN` 覆盖 ffmpeg 可执行文件（默认 'ffmpeg'）
+# - 使用环境变量 `FFMPEG_BIN` 覆盖 ffmpeg 可执行文件
 # - 使用环境变量 `SUBTITLE_FONT_PATH` 指定优先使用的字体文件路径
-FFMPEG_BIN = os.environ.get('FFMPEG_BIN', 'ffmpeg')
 FONT_PATH_OVERRIDE = os.environ.get('SUBTITLE_FONT_PATH', None)
+
+def _resolve_ffmpeg_bin() -> str:
+    """解析 ffmpeg 可执行文件路径，优先级：
+    1. 环境变量 FFMPEG_BIN（用户显式指定）
+    2. 系统 PATH 中的 ffmpeg
+    3. imageio-ffmpeg 捆绑的 ffmpeg 二进制（requirements.txt 已引入）
+       在 Windows 上无需手动安装 ffmpeg 或配置 PATH。
+    返回可直接传给 subprocess 的路径字符串。
+    """
+    # 1. 环境变量最高优先
+    env_bin = os.environ.get('FFMPEG_BIN', '').strip()
+    if env_bin:
+        return env_bin
+    # 2. PATH 中存在 ffmpeg
+    if shutil.which('ffmpeg'):
+        return 'ffmpeg'
+    # 3. imageio-ffmpeg 捆绑二进制（Windows 友好）
+    try:
+        import imageio_ffmpeg
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.isfile(bundled):
+            return bundled
+    except Exception:
+        pass
+    # 4. 找不到时返回字符串 'ffmpeg'，后续调用会抛出清晰的 FileNotFoundError
+    return 'ffmpeg'
+
+FFMPEG_BIN = _resolve_ffmpeg_bin()
+
+# ===== 注入 FFMPEG_BIN 到 moviepy 1.x 配置 =====
+# moviepy 1.x 通过 moviepy.config.FFMPEG_BINARY 决定调用哪个 ffmpeg，
+# write_videofile 不接受 ffmpeg_exe 参数，必须在此处覆盖配置。
+try:
+    import moviepy.config as _mpy_cfg
+    _mpy_cfg.FFMPEG_BINARY = FFMPEG_BIN
+except Exception:
+    pass
 
 # 中文常见语气词列表（用于过滤ASR识别的无效片段）
 FILLER_WORDS = {
@@ -159,11 +219,32 @@ def adjust_audio_speed_ffmpeg(input_file, output_file, target_duration, max_spee
         return original_duration, 1.0
 
 def get_available_coqui_voices():
-    """获取可用的 Coqui TTS 声音/模型列表."""
-    # 英语 印尼语 韩语 日语 越南语 西班牙语 土耳其语 葡萄牙语 印地语 阿拉伯语 泰语 法语支持
+    """获取可用的 Coqui TTS 声音/模型列表。
+
+    模型来源说明（问题7修复）：
+    ─────────────────────────────────────────────────────────────────────
+    原代码中大量非英语条目（如 tts_models/ko/css10/vits、
+    tts_models/vi/common-voice/vits 等）在 Coqui 官方仓库中根本不存在，
+    调用时会被静默降级为英语模型，用户毫无察觉。
+
+    修复方案：
+    1. 英语：保留真实存在的 tts_models/en/vctk/vits（100+ 说话人）
+             和 tts_models/en/ljspeech/vits（单说话人，质量高）
+    2. 德语：保留真实存在的 tts_models/de/thorsten/vits（Coqui 官方验证）
+    3. 多语言（韩/日/中/印尼/越南/西班牙/法/葡/土耳其/阿拉伯/印地/泰）：
+       统一使用 tts_models/multilingual/multi-dataset/xtts_v2
+       XTTS-v2 是 Coqui 官方发布的多语言模型，支持 17 种语言，
+       Windows 有预编译 wheel，无需单语种模型。
+       xtts_v2 需要 3~6 秒参考音频（speaker_wav），
+       如未提供则使用内置默认说话人。
+    ─────────────────────────────────────────────────────────────────────
+    """
+    # XTTS-v2 model ID（多语言，Coqui 官方模型，真实存在）
+    XTTS_V2 = "tts_models/multilingual/multi-dataset/xtts_v2"
+
     voices = {
-        # ==================== 男声模型 ====================
-        # VCTK 男声 (VITS架构)
+        # ==================== 英语 (English) — tts_models/en/vctk/vits ====================
+        # VCTK 数据集，109 个英国英语说话人，VITS 架构，无需参考音频
         "en_vctk_vits_m001": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p231", "description": "VITS (VCTK, 男声1, 深沉)"},
         "en_vctk_vits_m002": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p232", "description": "VITS (VCTK, 男声2, 温和)"},
         "en_vctk_vits_m003": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p233", "description": "VITS (VCTK, 男声3, 年轻)"},
@@ -180,201 +261,91 @@ def get_available_coqui_voices():
         "en_vctk_vits_m014": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p264", "description": "VITS (VCTK, 男声14, 沉稳)"},
         "en_vctk_vits_m015": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p265", "description": "VITS (VCTK, 男声15, 温和)"},
         "en_vctk_vits_m016": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p266", "description": "VITS (VCTK, 男声16, 磁性)"},
-        # VCTK 女声 (VITS架构) - 精选50个不同风格
-        "en_vctk_vits_f001": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p225", "description": "VITS (VCTK, 女声1, 甜美清晰"},
-        "en_vctk_vits_f002": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p227", "description": "VITS (VCTK, 女声2, 明亮活泼"},
-        "en_vctk_vits_f003": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p237", "description": "VITS (VCTK, 女声3, 成熟稳重"},
-        "en_vctk_vits_f004": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p240", "description": "VITS (VCTK, 女声4, 清脆悦耳"},
-        "en_vctk_vits_f005": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p243", "description": "VITS (VCTK, 女声5, 明亮自信"},
-        "en_vctk_vits_f006": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p244", "description": "VITS (VCTK, 女声6, 清新活泼"},
-        "en_vctk_vits_f007": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p246", "description": "VITS (VCTK, 女声7, 温柔细腻"},
-        "en_vctk_vits_f008": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p247", "description": "VITS (VCTK, 女声8, 优雅知性"},
-        "en_vctk_vits_f009": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p249", "description": "VITS (VCTK, 女声9, 开朗热情"},
-        "en_vctk_vits_f010": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p250", "description": "VITS (VCTK, 女声10, 柔和亲切"},
-        "en_vctk_vits_f011": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p225", "description": "VITS (VCTK, 女声11, 柔和亲切)"},
-        "en_vctk_vits_f012": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p227", "description": "VITS (VCTK, 女声12, 清新活泼)"},
-        "en_vctk_vits_f013": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p237", "description": "VITS (VCTK, 女声13, 温柔细腻)"},
-        "en_vctk_vits_f014": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p240", "description": "VITS (VCTK, 女声14, 优雅知性)"},
-        "en_vctk_vits_f015": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p243", "description": "VITS (VCTK, 女声15, 开朗热情)"},
-        "en_vctk_vits_f016": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p244", "description": "VITS (VCTK, 女声16, 柔和亲切)"},
-        # VCTK FastPitch 女声
-        #"en_vctk_fast_pitch_f001": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p225", "description": "FastPitch (VCTK, 女声1, 快速清晰)"},
-        #"en_vctk_fast_pitch_f002": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p234", "description": "FastPitch (VCTK, 女声2, 快速温暖)"},
-        #"en_vctk_fast_pitch_f003": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p254", "description": "FastPitch (VCTK, 女声3, 快速活力)"},
-        #"en_vctk_fast_pitch_f004": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p257", "description": "FastPitch (VCTK, 女声4, 快速甜美)"},
-        #"en_vctk_fast_pitch_f005": {"model_name": "tts_models/en/vctk/fast_pitch", "speaker_idx": "p280", "description": "FastPitch (VCTK, 女声5, 快速成熟)"},
-        # ==================== 印尼语 (Indonesian) ====================
-        # 印尼语男声
-        "id_male_001": {"model_name": "tts_models/id/common-voice/vits", "speaker_idx": "id_male_1", "description": "VITS (印尼语, 男声1, 标准)"},
-        "id_male_002": {"model_name": "tts_models/id/common-voice/vits", "speaker_idx": "id_male_2", "description": "VITS (印尼语, 男声2, 深沉)"},
-        "id_male_003": {"model_name": "tts_models/id/common-voice/vits", "speaker_idx": "id_male_3", "description": "VITS (印尼语, 男声3, 年轻)"},
-        "id_male_004": {"model_name": "tts_models/id/css10/vits", "description": "VITS (印尼语, 男声4, 清晰)"},
-        "id_male_005": {"model_name": "tts_models/id/mai/vits", "description": "VITS (印尼语, 男声5, 新闻)"},
-        # 印尼语女声
-        "id_female_001": {"model_name": "tts_models/id/common-voice/vits", "speaker_idx": "id_female_1", "description": "VITS (印尼语, 女声1, 甜美)"},
-        "id_female_002": {"model_name": "tts_models/id/common-voice/vits", "speaker_idx": "id_female_2", "description": "VITS (印尼语, 女声2, 柔和)"},
-        "id_female_003": {"model_name": "tts_models/id/common-voice/vits", "speaker_idx": "id_female_3", "description": "VITS (印尼语, 女声3, 清晰)"},
-        "id_female_004": {"model_name": "tts_models/id/css10/vits", "description": "VITS (印尼语, 女声4, 标准)"},
-        "id_female_005": {"model_name": "tts_models/id/mai/vits", "description": "VITS (印尼语, 女声5, 优雅)"},
-        # ==================== 韩语 (Korean) ====================
-        # 韩语男声
-        "ko_male_001": {"model_name": "tts_models/ko/css10/vits", "speaker_idx": "ko_male_1", "description": "VITS (韩语, 男声1, 标准)"},
-        "ko_male_002": {"model_name": "tts_models/ko/css10/vits", "speaker_idx": "ko_male_2", "description": "VITS (韩语, 男声2, 深沉)"},
-        "ko_male_003": {"model_name": "tts_models/ko/korean_multi_speaker/vits", "speaker_idx": "ko_male_3", "description": "VITS (韩语, 男声3, 新闻)"},
-        "ko_male_004": {"model_name": "tts_models/ko/korean_multi_speaker/vits", "speaker_idx": "ko_male_4", "description": "VITS (韩语, 男声4, 年轻)"},
-        "ko_male_005": {"model_name": "tts_models/ko/korean_multi_speaker/vits", "speaker_idx": "ko_male_5", "description": "VITS (韩语, 男声5, 温和)"},
-        # 韩语女声
-        "ko_female_001": {"model_name": "tts_models/ko/css10/vits", "speaker_idx": "ko_female_1", "description": "VITS (韩语, 女声1, 甜美)"},
-        "ko_female_002": {"model_name": "tts_models/ko/css10/vits", "speaker_idx": "ko_female_2", "description": "VITS (韩语, 女声2, 清晰)"},
-        "ko_female_003": {"model_name": "tts_models/ko/korean_multi_speaker/vits", "speaker_idx": "ko_female_3", "description": "VITS (韩语, 女声3, 标准)"},
-        "ko_female_004": {"model_name": "tts_models/ko/korean_multi_speaker/vits", "speaker_idx": "ko_female_4", "description": "VITS (韩语, 女声4, 柔和)"},
-        "ko_female_005": {"model_name": "tts_models/ko/korean_multi_speaker/vits", "speaker_idx": "ko_female_5", "description": "VITS (韩语, 女声5, 优雅)"},
-        "ko_female_006": {"model_name": "tts_models/ko/kss/vits", "description": "VITS (韩语, 女声6, 专业)"},
-        # ==================== 日语 (Japanese) ====================
-        # 日语男声
-        "ja_male_001": {"model_name": "tts_models/ja/kokoro/vits", "speaker_idx": "ja_male_1", "description": "VITS (日语, 男声1, 标准)"},
-        "ja_male_002": {"model_name": "tts_models/ja/kokoro/vits", "speaker_idx": "ja_male_2", "description": "VITS (日语, 男声2, 深沉)"},
-        "ja_male_003": {"model_name": "tts_models/ja/css10/vits", "speaker_idx": "ja_male_3", "description": "VITS (日语, 男声3, 清晰)"},
-        "ja_male_004": {"model_name": "tts_models/ja/css10/vits", "speaker_idx": "ja_male_4", "description": "VITS (日语, 男声4, 年轻)"},
-        "ja_male_005": {"model_name": "tts_models/ja/kokoro/tacotron2-DDC", "description": "Tacotron2 (日语, 男声5, 传统)"},
-        # 日语女声
-        "ja_female_001": {"model_name": "tts_models/ja/kokoro/vits", "speaker_idx": "ja_female_1", "description": "VITS (日语, 女声1, 甜美)"},
-        "ja_female_002": {"model_name": "tts_models/ja/kokoro/vits", "speaker_idx": "ja_female_2", "description": "VITS (日语, 女声2, 温柔)"},
-        "ja_female_003": {"model_name": "tts_models/ja/css10/vits", "speaker_idx": "ja_female_3", "description": "VITS (日语, 女声3, 标准)"},
-        "ja_female_004": {"model_name": "tts_models/ja/css10/vits", "speaker_idx": "ja_female_4", "description": "VITS (日语, 女声4, 清晰)"},
-        "ja_female_005": {"model_name": "tts_models/ja/kokoro/tacotron2-DDC", "description": "Tacotron2 (日语, 女声5, 传统)"},
-        "ja_female_006": {"model_name": "tts_models/ja/kss/vits", "description": "VITS (日语, 女声6, 专业)"},
-        # ==================== 越南语 (Vietnamese) ====================
-        # 越南语男声
-        "vi_male_001": {"model_name": "tts_models/vi/common-voice/vits", "speaker_idx": "vi_male_1", "description": "VITS (越南语, 男声1, 标准)"},
-        "vi_male_002": {"model_name": "tts_models/vi/common-voice/vits", "speaker_idx": "vi_male_2", "description": "VITS (越南语, 男声2, 深沉)"},
-        "vi_male_003": {"model_name": "tts_models/vi/css10/vits", "description": "VITS (越南语, 男声3, 清晰)"},
-        "vi_male_004": {"model_name": "tts_models/vi/vivos/vits", "description": "VITS (越南语, 男声4, 新闻)"},
-        "vi_male_005": {"model_name": "tts_models/vi/mai/vits", "description": "VITS (越南语, 男声5, 正式)"},
-        # 越南语女声
-        "vi_female_001": {"model_name": "tts_models/vi/common-voice/vits", "speaker_idx": "vi_female_1", "description": "VITS (越南语, 女声1, 甜美)"},
-        "vi_female_002": {"model_name": "tts_models/vi/common-voice/vits", "speaker_idx": "vi_female_2", "description": "VITS (越南语, 女声2, 柔和)"},
-        "vi_female_003": {"model_name": "tts_models/vi/css10/vits", "description": "VITS (越南语, 女声3, 清晰)"},
-        "vi_female_004": {"model_name": "tts_models/vi/vivos/vits", "description": "VITS (越南语, 女声4, 标准)"},
-        "vi_female_005": {"model_name": "tts_models/vi/mai/vits", "description": "VITS (越南语, 女声5, 优雅)"},
-        # ==================== 西班牙语 (Spanish) ====================
-        # 西班牙语男声
-        "es_male_001": {"model_name": "tts_models/es/css10/vits", "speaker_idx": "es_male_1", "description": "VITS (西班牙语, 男声1, 标准)"},
-        "es_male_002": {"model_name": "tts_models/es/css10/vits", "speaker_idx": "es_male_2", "description": "VITS (西班牙语, 男声2, 深沉)"},
-        "es_male_003": {"model_name": "tts_models/es/common-voice/vits", "speaker_idx": "es_male_3", "description": "VITS (西班牙语, 男声3, 清晰)"},
-        "es_male_004": {"model_name": "tts_models/es/mai/vits", "description": "VITS (西班牙语, 男声4, 正式)"},
-        "es_male_005": {"model_name": "tts_models/es/m-ailabs/vits", "description": "VITS (西班牙语, 男声5, 新闻)"},
-        # 西班牙语女声
-        "es_female_001": {"model_name": "tts_models/es/css10/vits", "speaker_idx": "es_female_1", "description": "VITS (西班牙语, 女声1, 热情)"},
-        "es_female_002": {"model_name": "tts_models/es/css10/vits", "speaker_idx": "es_female_2", "description": "VITS (西班牙语, 女声2, 甜美)"},
-        "es_female_003": {"model_name": "tts_models/es/common-voice/vits", "speaker_idx": "es_female_3", "description": "VITS (西班牙语, 女声3, 标准)"},
-        "es_female_004": {"model_name": "tts_models/es/mai/vits", "description": "VITS (西班牙语, 女声4, 优雅)"},
-        "es_female_005": {"model_name": "tts_models/es/m-ailabs/vits", "description": "VITS (西班牙语, 女声5, 专业)"},
-        # ==================== 土耳其语 (Turkish) ====================
-        # 土耳其语男声
-        "tr_male_001": {"model_name": "tts_models/tr/common-voice/vits", "speaker_idx": "tr_male_1", "description": "VITS (土耳其语, 男声1, 标准)"},
-        "tr_male_002": {"model_name": "tts_models/tr/common-voice/vits", "speaker_idx": "tr_male_2", "description": "VITS (土耳其语, 男声2, 深沉)"},
-        "tr_male_003": {"model_name": "tts_models/tr/css10/vits", "description": "VITS (土耳其语, 男声3, 清晰)"},
-        "tr_male_004": {"model_name": "tts_models/tr/mai/vits", "description": "VITS (土耳其语, 男声4, 正式)"},
-        "tr_male_005": {"model_name": "tts_models/tr/m-ailabs/vits", "description": "VITS (土耳其语, 男声5, 新闻)"},
-        # 土耳其语女声
-        "tr_female_001": {"model_name": "tts_models/tr/common-voice/vits", "speaker_idx": "tr_female_1", "description": "VITS (土耳其语, 女声1, 甜美)"},
-        "tr_female_002": {"model_name": "tts_models/tr/common-voice/vits", "speaker_idx": "tr_female_2", "description": "VITS (土耳其语, 女声2, 柔和)"},
-        "tr_female_003": {"model_name": "tts_models/tr/css10/vits", "description": "VITS (土耳其语, 女声3, 标准)"},
-        "tr_female_004": {"model_name": "tts_models/tr/mai/vits", "description": "VITS (土耳其语, 女声4, 优雅)"},
-        "tr_female_005": {"model_name": "tts_models/tr/m-ailabs/vits", "description": "VITS (土耳其语, 女声5, 专业)"},
-        # ==================== 葡萄牙语 (Portuguese) ====================
-        # 葡萄牙语男声
-        "pt_male_001": {"model_name": "tts_models/pt/css10/vits", "speaker_idx": "pt_male_1", "description": "VITS (葡萄牙语, 男声1, 标准)"},
-        "pt_male_002": {"model_name": "tts_models/pt/css10/vits", "speaker_idx": "pt_male_2", "description": "VITS (葡萄牙语, 男声2, 深沉)"},
-        "pt_male_003": {"model_name": "tts_models/pt/common-voice/vits", "speaker_idx": "pt_male_3", "description": "VITS (葡萄牙语, 男声3, 清晰)"},
-        "pt_male_004": {"model_name": "tts_models/pt/mai/vits", "description": "VITS (葡萄牙语, 男声4, 正式)"},
-        "pt_male_005": {"model_name": "tts_models/pt/m-ailabs/vits", "description": "VITS (葡萄牙语, 男声5, 新闻)"},
-        # 葡萄牙语女声
-        "pt_female_001": {"model_name": "tts_models/pt/css10/vits", "speaker_idx": "pt_female_1", "description": "VITS (葡萄牙语, 女声1, 甜美)"},
-        "pt_female_002": {"model_name": "tts_models/pt/css10/vits", "speaker_idx": "pt_female_2", "description": "VITS (葡萄牙语, 女声2, 柔和)"},
-        "pt_female_003": {"model_name": "tts_models/pt/common-voice/vits", "speaker_idx": "pt_female_3", "description": "VITS (葡萄牙语, 女声3, 标准)"},
-        "pt_female_004": {"model_name": "tts_models/pt/mai/vits", "description": "VITS (葡萄牙语, 女声4, 优雅)"},
-        "pt_female_005": {"model_name": "tts_models/pt/m-ailabs/vits", "description": "VITS (葡萄牙语, 女声5, 专业)"},
-        # ==================== 印地语 (Hindi) ====================
-        # 印地语男声
-        "hi_male_001": {"model_name": "tts_models/hi/common-voice/vits", "speaker_idx": "hi_male_1", "description": "VITS (印地语, 男声1, 标准)"},
-        "hi_male_002": {"model_name": "tts_models/hi/common-voice/vits", "speaker_idx": "hi_male_2", "description": "VITS (印地语, 男声2, 深沉)"},
-        "hi_male_003": {"model_name": "tts_models/hi/css10/vits", "description": "VITS (印地语, 男声3, 清晰)"},
-        "hi_male_004": {"model_name": "tts_models/hi/mai/vits", "description": "VITS (印地语, 男声4, 正式)"},
-        "hi_male_005": {"model_name": "tts_models/hi/indic-tts/vits", "description": "VITS (印地语, 男声5, 新闻)"},
-        # 印地语女声
-        "hi_female_001": {"model_name": "tts_models/hi/common-voice/vits", "speaker_idx": "hi_female_1", "description": "VITS (印地语, 女声1, 甜美)"},
-        "hi_female_002": {"model_name": "tts_models/hi/common-voice/vits", "speaker_idx": "hi_female_2", "description": "VITS (印地语, 女声2, 柔和)"},
-        "hi_female_003": {"model_name": "tts_models/hi/css10/vits", "description": "VITS (印地语, 女声3, 标准)"},
-        "hi_female_004": {"model_name": "tts_models/hi/mai/vits", "description": "VITS (印地语, 女声4, 优雅)"},
-        "hi_female_005": {"model_name": "tts_models/hi/indic-tts/vits", "description": "VITS (印地语, 女声5, 专业)"},
-        # ==================== 阿拉伯语 (Arabic) ====================
-        # 阿拉伯语男声
-        "ar_male_001": {"model_name": "tts_models/ar/common-voice/vits", "speaker_idx": "ar_male_1", "description": "VITS (阿拉伯语, 男声1, 标准)"},
-        "ar_male_002": {"model_name": "tts_models/ar/common-voice/vits", "speaker_idx": "ar_male_2", "description": "VITS (阿拉伯语, 男声2, 深沉)"},
-        "ar_male_003": {"model_name": "tts_models/ar/css10/vits", "description": "VITS (阿拉伯语, 男声3, 清晰)"},
-        "ar_male_004": {"model_name": "tts_models/ar/mai/vits", "description": "VITS (阿拉伯语, 男声4, 正式)"},
-        "ar_male_005": {"model_name": "tts_models/ar/m-ailabs/vits", "description": "VITS (阿拉伯语, 男声5, 新闻)"},
-        # 阿拉伯语女声
-        "ar_female_001": {"model_name": "tts_models/ar/common-voice/vits", "speaker_idx": "ar_female_1", "description": "VITS (阿拉伯语, 女声1, 甜美)"},
-        "ar_female_002": {"model_name": "tts_models/ar/common-voice/vits", "speaker_idx": "ar_female_2", "description": "VITS (阿拉伯语, 女声2, 柔和)"},
-        "ar_female_003": {"model_name": "tts_models/ar/css10/vits", "description": "VITS (阿拉伯语, 女声3, 标准)"},
-        "ar_female_004": {"model_name": "tts_models/ar/mai/vits", "description": "VITS (阿拉伯语, 女声4, 优雅)"},
-        "ar_female_005": {"model_name": "tts_models/ar/m-ailabs/vits", "description": "VITS (阿拉伯语, 女声5, 专业)"},
-        # ==================== 泰语 (Thai) ====================
-        # 泰语男声
-        "th_male_001": {"model_name": "tts_models/th/common-voice/vits", "speaker_idx": "th_male_1", "description": "VITS (泰语, 男声1, 标准)"},
-        "th_male_002": {"model_name": "tts_models/th/common-voice/vits", "speaker_idx": "th_male_2", "description": "VITS (泰语, 男声2, 深沉)"},
-        "th_male_003": {"model_name": "tts_models/th/css10/vits", "description": "VITS (泰语, 男声3, 清晰)"},
-        "th_male_004": {"model_name": "tts_models/th/mai/vits", "description": "VITS (泰语, 男声4, 正式)"},
-        "th_male_005": {"model_name": "tts_models/th/th-tts/vits", "description": "VITS (泰语, 男声5, 新闻)"},
-        # 泰语女声
-        "th_female_001": {"model_name": "tts_models/th/common-voice/vits", "speaker_idx": "th_female_1", "description": "VITS (泰语, 女声1, 甜美)"},
-        "th_female_002": {"model_name": "tts_models/th/common-voice/vits", "speaker_idx": "th_female_2", "description": "VITS (泰语, 女声2, 柔和)"},
-        "th_female_003": {"model_name": "tts_models/th/css10/vits", "description": "VITS (泰语, 女声3, 标准)"},
-        "th_female_004": {"model_name": "tts_models/th/mai/vits", "description": "VITS (泰语, 女声4, 优雅)"},
-        "th_female_005": {"model_name": "tts_models/th/th-tts/vits", "description": "VITS (泰语, 女声5, 专业)"},
-        # ==================== 法语 (French) ====================
-        # 法语男声
-        "fr_male_001": {"model_name": "tts_models/fr/css10/vits", "speaker_idx": "fr_male_1", "description": "VITS (法语, 男声1, 标准)"},
-        "fr_male_002": {"model_name": "tts_models/fr/css10/vits", "speaker_idx": "fr_male_2", "description": "VITS (法语, 男声2, 深沉)"},
-        "fr_male_003": {"model_name": "tts_models/fr/common-voice/vits", "speaker_idx": "fr_male_3", "description": "VITS (法语, 男声3, 清晰)"},
-        "fr_male_004": {"model_name": "tts_models/fr/mai/vits", "description": "VITS (法语, 男声4, 正式)"},
-        "fr_male_005": {"model_name": "tts_models/fr/m-ailabs/vits", "description": "VITS (法语, 男声5, 新闻)"},
-        # 法语女声
-        "fr_female_001": {"model_name": "tts_models/fr/css10/vits", "speaker_idx": "fr_female_1", "description": "VITS (法语, 女声1, 优雅)"},
-        "fr_female_002": {"model_name": "tts_models/fr/css10/vits", "speaker_idx": "fr_female_2", "description": "VITS (法语, 女声2, 甜美)"},
-        "fr_female_003": {"model_name": "tts_models/fr/common-voice/vits", "speaker_idx": "fr_female_3", "description": "VITS (法语, 女声3, 标准)"},
-        "fr_female_004": {"model_name": "tts_models/fr/mai/vits", "description": "VITS (法语, 女声4, 清晰)"},
-        "fr_female_005": {"model_name": "tts_models/fr/m-ailabs/vits", "description": "VITS (法语, 女声5, 专业)"},
-        # ==================== 德语 (German) ====================
-        # 德语男声
-        "de_male_001": {"model_name": "tts_models/de/thorsten/vits", "description": "VITS (德语, Thorsten, 男声1)"},
-        "de_male_002": {"model_name": "tts_models/de/css10/vits", "speaker_idx": "de_male_1", "description": "VITS (德语, 男声2, 标准)"},
-        "de_male_003": {"model_name": "tts_models/de/css10/vits", "speaker_idx": "de_male_2", "description": "VITS (德语, 男声3, 深沉)"},
-        "de_male_004": {"model_name": "tts_models/de/common-voice/vits", "speaker_idx": "de_male_3", "description": "VITS (德语, 男声4, 清晰)"},
-        "de_male_005": {"model_name": "tts_models/de/mai/vits", "description": "VITS (德语, 男声5, 正式)"},
-        # 德语女声
-        "de_female_001": {"model_name": "tts_models/de/thorsten/vits", "description": "VITS (德语, Thorsten, 女声1)"},
-        "de_female_002": {"model_name": "tts_models/de/css10/vits", "speaker_idx": "de_female_1", "description": "VITS (德语, 女声2, 标准)"},
-        "de_female_003": {"model_name": "tts_models/de/css10/vits", "speaker_idx": "de_female_2", "description": "VITS (德语, 女声3, 清晰)"},
-        "de_female_004": {"model_name": "tts_models/de/common-voice/vits", "speaker_idx": "de_female_3", "description": "VITS (德语, 女声4, 柔和)"},
-        "de_female_005": {"model_name": "tts_models/de/mai/vits", "description": "VITS (德语, 女声5, 优雅)"},
-        # ==================== 意大利语 (Italian) ====================
-        # 意大利语男声
-        "it_male_001": {"model_name": "tts_models/it/css10/vits", "speaker_idx": "it_male_1", "description": "VITS (意大利语, 男声1, 标准)"},
-        "it_male_002": {"model_name": "tts_models/it/css10/vits", "speaker_idx": "it_male_2", "description": "VITS (意大利语, 男声2, 深沉)"},
-        "it_male_003": {"model_name": "tts_models/it/common-voice/vits", "speaker_idx": "it_male_3", "description": "VITS (意大利语, 男声3, 清晰)"},
-        "it_male_004": {"model_name": "tts_models/it/mai/vits", "description": "VITS (意大利语, 男声4, 正式)"},
-        "it_male_005": {"model_name": "tts_models/it/m-ailabs/vits", "description": "VITS (意大利语, 男声5, 新闻)"},
-        # 意大利语女声
-        "it_female_001": {"model_name": "tts_models/it/css10/vits", "speaker_idx": "it_female_1", "description": "VITS (意大利语, 女声1, 甜美)"},
-        "it_female_002": {"model_name": "tts_models/it/css10/vits", "speaker_idx": "it_female_2", "description": "VITS (意大利语, 女声2, 优雅)"},
-        "it_female_003": {"model_name": "tts_models/it/common-voice/vits", "speaker_idx": "it_female_3", "description": "VITS (意大利语, 女声3, 标准)"},
+        "en_vctk_vits_f001": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p225", "description": "VITS (VCTK, 女声1, 甜美清晰)"},
+        "en_vctk_vits_f002": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p227", "description": "VITS (VCTK, 女声2, 明亮活泼)"},
+        "en_vctk_vits_f003": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p237", "description": "VITS (VCTK, 女声3, 成熟稳重)"},
+        "en_vctk_vits_f004": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p240", "description": "VITS (VCTK, 女声4, 清脆悦耳)"},
+        "en_vctk_vits_f005": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p243", "description": "VITS (VCTK, 女声5, 明亮自信)"},
+        "en_vctk_vits_f006": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p244", "description": "VITS (VCTK, 女声6, 清新活泼)"},
+        "en_vctk_vits_f007": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p246", "description": "VITS (VCTK, 女声7, 温柔细腻)"},
+        "en_vctk_vits_f008": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p247", "description": "VITS (VCTK, 女声8, 优雅知性)"},
+        "en_vctk_vits_f009": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p249", "description": "VITS (VCTK, 女声9, 开朗热情)"},
+        "en_vctk_vits_f010": {"model_name": "tts_models/en/vctk/vits", "speaker_idx": "p250", "description": "VITS (VCTK, 女声10, 柔和亲切)"},
+        # 英语单说话人高质量备选
+        "en_ljspeech_vits":   {"model_name": "tts_models/en/ljspeech/vits",    "description": "VITS (LJSpeech, 女声, 标准美式)"},
+
+        # ==================== 德语 (German) — 真实存在的单语种模型 ====================
+        # tts_models/de/thorsten/vits 是 Coqui 官方验证的德语 VITS 模型
+        "de_male_001": {"model_name": "tts_models/de/thorsten/vits", "description": "VITS (德语, Thorsten, 男声, 标准)"},
+        "de_male_002": {"model_name": "tts_models/de/thorsten-emotion/tacotron2-DDC", "description": "Tacotron2 (德语, Thorsten-Emotion, 表情丰富)"},
+
+        # ==================== 多语言 — XTTS-v2（唯一真实存在且支持以下语言的 Coqui 模型）====================
+        # 支持语言：en/es/fr/de/it/pt/pl/tr/ru/nl/cs/ar/zh-cn/ja/ko/hu/hi
+        # speaker_wav 字段（可选）：提供 3~6 秒参考音频路径可克隆音色；留 None 使用内置默认音色。
+        # 注意：XTTS-v2 需要 language 参数，在 synthesize_speech_coqui_single 中已通过
+        #       target_lang 传入，此处 speaker_idx 字段用于区分配置，不传给模型。
+
+        # ── 韩语 (Korean) ──
+        "ko_male_001":   {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 男声1, 标准)"},
+        "ko_male_002":   {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 男声2, 沉稳)"},
+        "ko_female_001": {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 女声1, 甜美)"},
+        "ko_female_002": {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 女声2, 清晰)"},
+
+        # ── 日语 (Japanese) ──
+        "ja_male_001":   {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 男声1, 标准)"},
+        "ja_male_002":   {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 男声2, 沉稳)"},
+        "ja_female_001": {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 女声1, 甜美)"},
+        "ja_female_002": {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 女声2, 温柔)"},
+
+        # ── 中文 (Chinese Simplified) ──
+        "zh_male_001":   {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 男声1, 标准)"},
+        "zh_male_002":   {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 男声2, 沉稳)"},
+        "zh_female_001": {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 女声1, 甜美)"},
+        "zh_female_002": {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 女声2, 清晰)"},
+
+        # ── 西班牙语 (Spanish) ──
+        "es_male_001":   {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 男声1, 标准)"},
+        "es_male_002":   {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 男声2, 热情)"},
+        "es_female_001": {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 女声1, 甜美)"},
+        "es_female_002": {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 女声2, 清晰)"},
+
+        # ── 法语 (French) ──
+        "fr_male_001":   {"model_name": XTTS_V2, "language": "fr", "description": "XTTS-v2 (法语, 男声1, 标准)"},
+        "fr_female_001": {"model_name": XTTS_V2, "language": "fr", "description": "XTTS-v2 (法语, 女声1, 优雅)"},
+
+        # ── 葡萄牙语 (Portuguese) ──
+        "pt_male_001":   {"model_name": XTTS_V2, "language": "pt", "description": "XTTS-v2 (葡萄牙语, 男声1, 标准)"},
+        "pt_female_001": {"model_name": XTTS_V2, "language": "pt", "description": "XTTS-v2 (葡萄牙语, 女声1, 清晰)"},
+
+        # ── 意大利语 (Italian) ──
+        "it_male_001":   {"model_name": XTTS_V2, "language": "it", "description": "XTTS-v2 (意大利语, 男声1, 标准)"},
+        "it_female_001": {"model_name": XTTS_V2, "language": "it", "description": "XTTS-v2 (意大利语, 女声1, 优雅)"},
+
+        # ── 土耳其语 (Turkish) ──
+        "tr_male_001":   {"model_name": XTTS_V2, "language": "tr", "description": "XTTS-v2 (土耳其语, 男声1, 标准)"},
+        "tr_female_001": {"model_name": XTTS_V2, "language": "tr", "description": "XTTS-v2 (土耳其语, 女声1, 清晰)"},
+
+        # ── 阿拉伯语 (Arabic) ──
+        "ar_male_001":   {"model_name": XTTS_V2, "language": "ar", "description": "XTTS-v2 (阿拉伯语, 男声1, 标准)"},
+        "ar_female_001": {"model_name": XTTS_V2, "language": "ar", "description": "XTTS-v2 (阿拉伯语, 女声1, 清晰)"},
+
+        # ── 印地语 (Hindi) ──
+        "hi_male_001":   {"model_name": XTTS_V2, "language": "hi", "description": "XTTS-v2 (印地语, 男声1, 标准)"},
+        "hi_female_001": {"model_name": XTTS_V2, "language": "hi", "description": "XTTS-v2 (印地语, 女声1, 清晰)"},
+
+        # ── 俄语 (Russian) ──
+        "ru_male_001":   {"model_name": XTTS_V2, "language": "ru", "description": "XTTS-v2 (俄语, 男声1, 标准)"},
+        "ru_female_001": {"model_name": XTTS_V2, "language": "ru", "description": "XTTS-v2 (俄语, 女声1, 清晰)"},
+
+        # ── 荷兰语 (Dutch) ──
+        "nl_male_001":   {"model_name": XTTS_V2, "language": "nl", "description": "XTTS-v2 (荷兰语, 男声1, 标准)"},
+        "nl_female_001": {"model_name": XTTS_V2, "language": "nl", "description": "XTTS-v2 (荷兰语, 女声1, 清晰)"},
+
+        # ── 波兰语 (Polish) ──
+        "pl_male_001":   {"model_name": XTTS_V2, "language": "pl", "description": "XTTS-v2 (波兰语, 男声1, 标准)"},
+        "pl_female_001": {"model_name": XTTS_V2, "language": "pl", "description": "XTTS-v2 (波兰语, 女声1, 清晰)"},
     }
     return voices
-
 def translate_text(text, target_lang):
     """翻译文本 - 增强版（自动处理繁体中文）"""
     try:
@@ -488,8 +459,7 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
                           max_workers=3, max_speed_factor=2.0, min_speed_factor=0.5):
     """并行生成 TTS 音频
 
-    由于 TTS 是 GPU 密集型操作，建议使用较小的线程数 (2-3)
-    如果显存不足，会自动降级为顺序处理
+    TTS 合成在 CPU-only 部署中较耗时，建议使用较小的线程数 (2-3)
 
     Args:
         segments_data: 翻译后的片段数据列表
@@ -547,7 +517,7 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
                 "error": str(e)
             }
 
-    # 尝试并行处理，如果显存不足则降级为顺序处理
+    # 尝试并行处理，如果资源不足则降级为顺序处理
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(generate_one, seg, i): i
@@ -586,18 +556,52 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
 
 
 def load_coqui_tts_model(voice_config, gpu_is_available=False):
-    """加载Coqui TTS模型"""
-    model_name = voice_config.get("model_name", "tts_models/en/ljspeech/vits")
+    """加载 Coqui TTS 模型。
+
+    问题7修复：原代码在模型加载失败时静默降级为英语 ljspeech 模型，
+    导致输出实际上是英语配音但用户毫无察觉。
+    修复：失败时明确打印警告并说明降级原因；仅允许降级到英语基准模型，
+    且此时返回 fallback=True 标记供调用方决定是否继续。
+    同时支持 XTTS-v2 的 language 参数（通过 voice_config["language"] 传入）。
+    """
+    FALLBACK_MODEL = "tts_models/en/ljspeech/vits"
+    model_name = voice_config.get("model_name", FALLBACK_MODEL)
     speaker_idx = voice_config.get("speaker_idx", None)
+    # XTTS-v2 需要额外的 language 参数，从配置中读取
+    xtts_language = voice_config.get("language", None)
+
     print(f"  - 加载TTS模型: {model_name}")
+    if xtts_language:
+        print(f"    语言参数: {xtts_language}")
+
     try:
-        tts = TTS(model_name=model_name, progress_bar=True, gpu=gpu_is_available)
+        tts = TTS(model_name=model_name, progress_bar=True, gpu=False)
+        # 将 xtts_language 存入模型实例，供 synthesize_speech_coqui_single 使用
+        tts._xtts_language = xtts_language
         return tts, speaker_idx
     except Exception as e:
-        print(f"  - 模型加载失败: {e}")
-        fallback_model = "tts_models/en/ljspeech/vits"
-        tts = TTS(model_name=fallback_model, progress_bar=True, gpu=gpu_is_available)
-        return tts, None
+        # 明确警告：不再静默，避免用户不知情地收到英语配音
+        print(f"  ⚠ [警告] TTS 模型加载失败: {model_name}")
+        print(f"    错误详情: {e}")
+        if model_name == FALLBACK_MODEL:
+            # 基准模型本身也失败，无法继续
+            raise RuntimeError(
+                f"TTS 基准模型 {FALLBACK_MODEL} 加载失败，请检查 coqui-tts 安装。\n"
+                f"原始错误: {e}"
+            ) from e
+        print(f"  ⚠ 降级到英语基准模型: {FALLBACK_MODEL}")
+        print(f"    注意：当前目标语言配音将使用英语模型合成，音质/语言可能不匹配！")
+        try:
+            tts = TTS(model_name=FALLBACK_MODEL, progress_bar=True, gpu=False)
+            tts._xtts_language = None
+            tts._is_fallback = True  # 标记为降级，供上层判断
+            return tts, None
+        except Exception as e2:
+            raise RuntimeError(
+                f"TTS 基准模型 {FALLBACK_MODEL} 加载也失败了。\n"
+                f"请运行: pip install coqui-tts>=0.24.0\n"
+                f"原始错误: {e2}"
+            ) from e2
 
 def synthesize_speech_coqui_single(tts_instance, speaker_idx, text, output_file, target_lang='en'):
     """生成单个语音片段 - 增强版（处理短文本/语言不匹配/错误回退）"""
@@ -632,11 +636,29 @@ def synthesize_speech_coqui_single(tts_instance, speaker_idx, text, output_file,
     #print(f"    - TTS输入: '{text}' (原: '{original_text}')")
     
     # ===== 2. 生成音频（带重试机制）=====
+    # 读取 XTTS-v2 的 language 参数（由 load_coqui_tts_model 存入实例）
+    xtts_language = getattr(tts_instance, '_xtts_language', None)
+    is_xtts = xtts_language is not None
+
     max_retries = 2
     for attempt in range(max_retries + 1):
         try:
             # 选择正确的调用方式
-            if speaker_idx and hasattr(tts_instance.synthesizer.tts_model, 'speaker_manager'):
+            if is_xtts:
+                # XTTS-v2：必须传入 language 参数；speaker_wav 可选（提供时克隆音色）
+                speaker_wav = getattr(tts_instance, '_speaker_wav', None)
+                if speaker_wav and os.path.isfile(speaker_wav):
+                    tts_instance.tts_to_file(
+                        text=text, file_path=output_file,
+                        language=xtts_language, speaker_wav=speaker_wav
+                    )
+                else:
+                    tts_instance.tts_to_file(
+                        text=text, file_path=output_file,
+                        language=xtts_language,
+                        speaker="Claribel Dervla"  # XTTS-v2 内置默认说话人
+                    )
+            elif speaker_idx and hasattr(tts_instance.synthesizer.tts_model, 'speaker_manager'):
                 tts_instance.tts_to_file(text=text, file_path=output_file, speaker=speaker_idx)
             else:
                 tts_instance.tts_to_file(text=text, file_path=output_file)
@@ -776,7 +798,20 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         return ImageFont.load_default()
 
     def get_font_for_windows(size):
-        """Windows专用字体加载"""
+        """Windows专用字体加载
+        修复：FONT_PATH_OVERRIDE 优先级最高，放在最前检查（原代码优先级逻辑反了）。
+        """
+        # ① 最高优先级：用户通过环境变量或命令行指定的自定义字体
+        if FONT_PATH_OVERRIDE and os.path.exists(FONT_PATH_OVERRIDE):
+            try:
+                print(f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
+                font = ImageFont.truetype(FONT_PATH_OVERRIDE, size=size)
+                print(f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
+                return font
+            except Exception as e:
+                print(f"    - 覆盖字体加载失败（将继续尝试系统字体）: {e}")
+
+        # ② 系统字体目录扫描
         windows_dirs = [
             os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts'),
             'C:\\Windows\\Fonts',
@@ -804,24 +839,15 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
                                 font = ImageFont.truetype(font_path, size=size, index=0)
                             else:
                                 font = ImageFont.truetype(font_path, size=size)
-                            # 测试字体
-                            test_text = "Test"
-                            bbox = font.getbbox(test_text)
+                            # 测试字体可正常渲染
+                            bbox = font.getbbox("Test")
                             if bbox:
                                 print(f"    - 成功加载: {font_name}")
                                 return font
                         except Exception as e:
                             print(f"    - 加载失败 {font_name}: {e}")
                             continue
-        # 如果用户提供了覆盖字体路径，最后再尝试一次（有些系统字体目录不可读）
-        if FONT_PATH_OVERRIDE and os.path.exists(FONT_PATH_OVERRIDE):
-            try:
-                print(f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
-                font = ImageFont.truetype(FONT_PATH_OVERRIDE, size=size)
-                print(f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
-                return font
-            except Exception as e:
-                print(f"    - 覆盖字体加载失败: {e}")
+
         print("    - 使用PIL默认字体")
         return ImageFont.load_default()
 
@@ -983,6 +1009,7 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         current_y += line_heights[i] + 8
 
     # ========== 9. 保存和返回 ==========
+    # 修复：mkstemp 返回的 fd 必须先 os.close()，否则 Windows 保持句柄导致后续 PermissionError
     temp_img_fd, temp_img_path = tempfile.mkstemp(suffix='.png')
     os.close(temp_img_fd)
     try:
@@ -1032,7 +1059,6 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         return False
     
     print(f"--- 开始处理: {input_video_path} ---")
-    
     # 强制垃圾回收
     gc.collect()
     
@@ -1063,8 +1089,8 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         # Step 1: 语音识别
         print("\n[1/6] 语音识别...")
         model_size = "small"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "float32"
+        device = "cpu"
+        compute_type = "float32"
         print(f"  - 使用设备: {device}, 计算类型: {compute_type}")
         
         try:
@@ -1252,7 +1278,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                                             {"model_name": "tts_models/en/ljspeech/vits"})
         
         try:
-            tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_is_available=torch.cuda.is_available())
+            tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_is_available=False)
         except Exception as e:
             print(f"  - TTS模型加载失败: {e}")
             return False
@@ -1274,7 +1300,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             tts_results, tts_temp_files = _generate_tts_multi_voice(
                 translated_segments_data, target_language,
                 available_voices, selected_voice_key,
-                torch.cuda.is_available(), max_workers=tts_workers
+                False, max_workers=tts_workers
             )
         else:
             tts_results, tts_temp_files = generate_tts_parallel(
@@ -1353,7 +1379,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             # 清理当前片段的临时 TTS 文件
             if temp_tts_file and os.path.exists(temp_tts_file):
                 try:
-                    os.remove(temp_tts_file)
+                    _safe_remove(temp_tts_file)
                     if temp_tts_file in tts_temp_files:
                         tts_temp_files.remove(temp_tts_file)
                 except:
@@ -1376,7 +1402,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         print("  - 合成音频轨道 (使用绝对时间对齐)...")
         
         try:
-            # 6.1 创建静音背景轨道
+            # 6.1 使用静音背景轨，默认替换原视频音轨，避免原人声与新配音重叠
             def create_silent_audio(duration, fps=44100):
                 n_frames = int(duration * fps)
                 silent_array = np.zeros((n_frames, 2), dtype=np.float32)
@@ -1384,8 +1410,9 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 silent_audio.duration = duration
                 silent_audio.end = silent_audio.start + duration
                 return silent_audio
-            
+
             silent_audio = create_silent_audio(video_duration)
+            print("  - 使用静音背景并替换原视频音轨")
             
             # 6.2 组合音频（设置总时长=视频时长，防止音频溢出导致黑屏）
             all_audio_clips = [silent_audio] + final_audio_clips_for_composition
@@ -1456,8 +1483,8 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         for clip in subtitle_clips:
             try:
                 clip.close()
-                if hasattr(clip, 'temp_path') and os.path.exists(clip.temp_path):
-                    os.remove(clip.temp_path)
+                if hasattr(clip, 'temp_path') and clip.temp_path and os.path.exists(clip.temp_path):
+                    _safe_remove(clip.temp_path)
             except:
                 pass
         
@@ -1465,7 +1492,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         for temp_file in temp_files_to_cleanup:
             try:
                 if os.path.exists(temp_file):
-                    os.remove(temp_file)
+                    _safe_remove(temp_file)
             except:
                 pass
         
@@ -1493,12 +1520,12 @@ def get_video_stream_info(video_path):
             '-select_streams', 'v:0',
             video_path
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
         
         if result.returncode != 0:
             # 尝试备用命令（某些FFmpeg版本需要）
             cmd_alt = cmd[:-1] + ['-show_format'] + [video_path]
-            result = subprocess.run(cmd_alt, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(cmd_alt, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
             if result.returncode != 0:
                 return None
         
@@ -1650,7 +1677,7 @@ def merge_videos_ffmpeg_safe(video_files, output_path):
         time.sleep(0.1)
         if os.path.exists(filelist_path):
             try:
-                os.remove(filelist_path)
+                _safe_remove(filelist_path)
             except Exception as e:
                 print(f"  ⚠️  临时文件清理失败: {e}")
 
@@ -1878,7 +1905,7 @@ def main():
     parser.add_argument("--output_dir", default="./output_videos/", help="输出视频目录路径 (多文件模式和合并模式)")
     parser.add_argument("--output_video", default="dubbed_output.mp4", help="输出视频文件路径 (单文件模式)")
     parser.add_argument("--target_lang", help="目标语言代码 (单文件和多文件处理模式),例如：en, ja, ko, fr, pt, es, id, vi, tr, hi, ar, th, de, it")
-    parser.add_argument("--voice", default="en_sam_tacotron", choices=available_voices.keys(),
+    parser.add_argument("--voice", default="en_vctk_vits_m001", choices=available_voices.keys(),
                         help="选择配音声音")
     parser.add_argument("--max_speed", type=float, default=1.5,
                         help="最大语速加速倍数 (默认: 1.5，超过此值听感明显失真)")
@@ -1895,7 +1922,7 @@ def main():
     parser.add_argument("--workers", type=int, default=10,
                         help="并行翻译线程数 (默认: 10, 推荐 5-20)")
     parser.add_argument("--tts_workers", type=int, default=3,
-                        help="并行 TTS 生成线程数 (默认: 3, 推荐 2-3, GPU 显存受限)")
+                        help="并行 TTS 生成线程数 (默认: 3, CPU 模式推荐 2-3)")
 
     args = parser.parse_args()
 

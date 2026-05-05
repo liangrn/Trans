@@ -91,13 +91,8 @@ def perform_diarization(audio_path: str, hf_token: str,
         print(f"  自动检测 ({Config.MIN_SPEAKERS}~{Config.MAX_SPEAKERS} 人)")
 
     pipeline = Pipeline.from_pretrained(Config.DIARIZATION_MODEL, token=token)
-
-    try:
-        if torch.cuda.is_available():
-            pipeline = pipeline.to(torch.device("cuda"))
-            print("  使用 GPU 加速")
-    except Exception:
-        pass
+    pipeline = pipeline.to(torch.device("cpu"))
+    print("  使用 CPU 模式")
 
     try:
         pipeline.instantiate({

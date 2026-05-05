@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Environment Setup
 
@@ -145,3 +145,11 @@ First run will automatically download:
 - `speechbrain/spkrec-ecapa-voxceleb` (speaker embeddings)
 
 Note: pyannote models require accepting user conditions on HuggingFace.
+
+<claude-mem-context>
+# Memory Context
+
+# [Trans] recent context, 2026-04-29 12:51pm GMT+8
+
+No previous sessions found.
+</claude-mem-context>
