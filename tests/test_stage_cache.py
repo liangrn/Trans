@@ -106,3 +106,49 @@ def test_audio_stage_manifest_ignores_unrelated_runtime_params(tmp_path):
     assert build_stage_manifest(first, "audio") == build_stage_manifest(second, "audio")
     assert build_stage_manifest(first, "translation") == build_stage_manifest(second, "translation")
     assert build_stage_manifest(first, "tts") != build_stage_manifest(second, "tts")
+
+
+def test_audio_stage_requires_readable_wav_outputs(tmp_path):
+    from stage_validators import validate_audio_stage
+
+    background = tmp_path / "background.wav"
+    dialogue = tmp_path / "dialogue.wav"
+    background.write_bytes(b"not a wav")
+    dialogue.write_bytes(b"not a wav")
+
+    ok, reason = validate_audio_stage(background, dialogue, expected_duration=10.0)
+
+    assert not ok
+    assert "不可读取" in reason or "时长" in reason
+
+
+def test_recognition_stage_rejects_malformed_segments(tmp_path):
+    from stage_validators import validate_recognition_stage
+
+    segments = tmp_path / "recognized_segments.json"
+    text = tmp_path / "recognized_text.txt"
+    atomic_write_json(segments, [{"text": "", "start": 3.0, "end": 2.0}])
+    text.write_text("", encoding="utf-8")
+
+    ok, reason = validate_recognition_stage(segments, text, video_duration=5.0)
+
+    assert not ok
+    assert "无效" in reason or "空" in reason
+
+
+def test_composition_stage_rejects_tiny_output(tmp_path):
+    from pipeline_stages import mark_composition_stage_complete
+
+    run = PipelineRun(
+        root_dir=tmp_path / "output" / "demo",
+        manifest={"command": {"target_language": "en"}},
+    )
+    output = tmp_path / "tiny.mp4"
+    output.write_bytes(b"x")
+
+    try:
+        mark_composition_stage_complete(run, str(output))
+    except RuntimeError as exc:
+        assert "最终合成产物无效" in str(exc)
+    else:
+        raise AssertionError("tiny composition output should be rejected")

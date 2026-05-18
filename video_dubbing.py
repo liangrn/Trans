@@ -8,6 +8,7 @@ import glob
 import math
 import json
 import warnings
+import hashlib
 
 # ===== TTS 导入：优先 coqui-tts（社区 fork），回退到原版 TTS =====
 try:
@@ -459,15 +460,17 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
         """生成单个 TTS 音频"""
         try:
             if cache_path:
-                temp_tts_file = str(cache_path / f"segment_{idx:04d}.wav")
+                temp_tts_file = str(cache_path / _build_tts_cache_filename(seg_data, idx, speaker_idx, target_lang))
                 if os.path.exists(temp_tts_file) and os.path.getsize(temp_tts_file) > 512:
-                    return {
-                        "idx": idx,
-                        "temp_tts_file": temp_tts_file,
-                        "seg_data": seg_data,
-                        "success": True,
-                        "cached": True,
-                    }
+                    if _is_valid_cached_tts_file(temp_tts_file):
+                        return {
+                            "idx": idx,
+                            "temp_tts_file": temp_tts_file,
+                            "seg_data": seg_data,
+                            "success": True,
+                            "cached": True,
+                        }
+                    _safe_remove(temp_tts_file)
             else:
                 tmp_orig = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
                 temp_tts_file = tmp_orig.name
@@ -535,6 +538,36 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
                 temp_files_to_cleanup.append(results[i]["temp_tts_file"])
 
     return results, temp_files_to_cleanup
+
+
+def _build_tts_cache_filename(seg_data, idx, speaker_idx, target_lang):
+    stable_idx = seg_data.get("idx", idx)
+    try:
+        stable_idx = int(stable_idx)
+    except (TypeError, ValueError):
+        stable_idx = idx
+
+    text = seg_data.get("translated_text") or seg_data.get("text") or ""
+    payload = json.dumps(
+        {
+            "target_lang": target_lang,
+            "speaker_idx": speaker_idx,
+            "text": text,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return f"segment_{stable_idx:04d}_{digest}.wav"
+
+
+def _is_valid_cached_tts_file(path):
+    try:
+        if not path or not os.path.exists(path) or os.path.getsize(path) <= 512:
+            return False
+        return _probe_audio_duration(path) > 0.1
+    except Exception:
+        return False
 
 
 def load_coqui_tts_model(voice_config, gpu_is_available=False):
@@ -1085,7 +1118,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             # OCR 和音频分离互不依赖，先并行启动；只有 OCR 不可用时才等待 dialogue.wav 做 ASR。
             with ThreadPoolExecutor(max_workers=2) as stage_executor:
                 audio_future = stage_executor.submit(
-                    get_or_create_audio_stage, pipeline_run, input_video_path
+                    get_or_create_audio_stage, pipeline_run, input_video_path, video_duration
                 )
                 recognition_future = stage_executor.submit(
                     get_or_create_recognition_stage,

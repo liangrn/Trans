@@ -71,8 +71,8 @@ pip install --upgrade pip setuptools wheel
 # 2. 先锁定 numpy（必须在 torch 之前）
 pip install "numpy>=1.24.0,<2.0.0"
 
-# 3. 安装 CPU 版 torch
-pip install torch>=2.3.0,<2.4.0 torchaudio>=2.3.0,<2.4.0 ^
+# 3. 安装 CPU 版 torch 栈
+pip install torch>=2.3.0,<2.4.0 torchaudio>=2.3.0,<2.4.0 torchvision>=0.18.0,<0.19.0 ^
     --index-url https://download.pytorch.org/whl/cpu
 
 # 4. 安装其余依赖
@@ -92,15 +92,17 @@ ocr_env\Scripts\python -m pip install paddleocr paddlepaddle opencv-python-headl
 # 7. ASR 兜底使用主环境中的 faster-whisper，无需创建独立 ASR 环境
 ```
 
+`separation_env` 和 `ocr_env` 不建议合并：前者服务于 `audio-separator[cpu]` / ONNX 音频分离栈，后者服务于 PaddleOCR / PaddlePaddle / OpenCV。分开安装能降低 Windows DLL、wheel、ABI 冲突面。
+
 ---
 
 ## 部署文档
 
-完整部署说明见 [DEPLOYMENT.md](/Users/liangrn/Downloads/Trans/DEPLOYMENT.md)。
+完整部署说明见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 这里先强调当前版本的几个硬要求：
 
-1. 当前版本固定为 CPU-only 运行，不再提供 GPU/CUDA 安装路径。
+1. 当前版本固定为 CPU-only 运行，不再提供显卡加速安装路径。
 2. 部署目录必须完整包含 `voice-gender-classifier/` 子目录，至少要有 `voice-gender-classifier/model.py`。
 3. 所有视频处理都会先做人声分离；部署目录必须有可用的 `separation_env` 或 PATH 中可用的 `audio-separator`。
 4. 中文文本识别优先使用硬字幕 OCR；只要 OCR 结果可用，就会跳过 ASR。部署目录必须有可用的 `ocr_env`，或用环境变量 `OCR_PYTHON` 指定 Python。
@@ -436,10 +438,11 @@ pip install torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.
 
 **`coqui-tts` 安装失败，报 `error: Microsoft Visual C++ 14.0 or greater is required`**
 
-系统缺少 C++ 编译环境。解决方案：
-1. 安装 [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/)，勾选"使用 C++ 的桌面开发"
-2. 安装 [espeak-ng](https://github.com/espeak-ng/espeak-ng/releases) 并加入 PATH
-3. 重新运行 `install_windows.bat`
+当前项目使用维护中的 `coqui-tts`，不再使用旧的原始 `TTS 0.22.0`。正常情况下 Windows 应优先安装 wheel；如果 pip 尝试源码编译，通常是 Python 版本、pip 版本或 wheel 匹配失败。解决方案：
+1. 确认 Python 是 3.10 或 3.11。
+2. 先运行 `python -m pip install --upgrade pip setuptools wheel`。
+3. 重新运行 `install_windows.bat`。
+4. 如果仍失败，再安装 [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/)，勾选"使用 C++ 的桌面开发"。
 
 或者直接指定版本跳过编译：
 ```bat

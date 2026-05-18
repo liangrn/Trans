@@ -93,7 +93,9 @@ def extract_hard_subtitles(video_path: str, interval: float, fast_interval: floa
 
     cap.release()
     samples = _filter_persistent_text_samples(samples)
-    return _merge_samples(samples, max_gap=interval * 2.5, sample_interval=interval)
+    segments = _merge_samples(samples, max_gap=interval * 2.5, sample_interval=interval)
+    segments = _filter_noisy_segments(segments)
+    return _dedupe_adjacent_segments(segments)
 
 
 def _scan_active_windows(cap, ocr, fps: float, frame_count: float, step: int, crop_top: float, min_conf: float) -> list[tuple[int, int]]:
@@ -305,23 +307,167 @@ def _merge_samples(samples: list[dict], max_gap: float, sample_interval: float) 
     return merged
 
 
-def _filter_persistent_text_samples(samples: list[dict], min_count: int = 4, min_span: float = 8.0) -> list[dict]:
-    """Drop exact repeated text that stays on screen like a watermark."""
+def _filter_persistent_text_samples(
+    samples: list[dict],
+    min_count: int = 4,
+    min_span: float = 8.0,
+    max_cluster_gap: float = 1.2,
+) -> list[dict]:
+    """Drop text that stays continuously on screen like a watermark."""
     grouped: dict[str, list[dict]] = {}
     for sample in samples:
         grouped.setdefault(sample["text"], []).append(sample)
 
     persistent_texts = set()
     for text, items in grouped.items():
-        if len(items) < min_count:
-            continue
-        span = max(item["time"] for item in items) - min(item["time"] for item in items)
-        if span >= min_span:
+        if _has_persistent_cluster(sorted(items, key=lambda item: item["time"]), min_count, min_span, max_cluster_gap):
             persistent_texts.add(text)
 
     if not persistent_texts:
         return samples
     return [sample for sample in samples if sample["text"] not in persistent_texts]
+
+
+def _has_persistent_cluster(items: list[dict], min_count: int, min_span: float, max_cluster_gap: float) -> bool:
+    cluster = []
+    for item in items:
+        if not cluster or item["time"] - cluster[-1]["time"] <= max_cluster_gap:
+            cluster.append(item)
+        else:
+            if _cluster_is_persistent(cluster, min_count, min_span):
+                return True
+            cluster = [item]
+    return _cluster_is_persistent(cluster, min_count, min_span)
+
+
+def _cluster_is_persistent(cluster: list[dict], min_count: int, min_span: float) -> bool:
+    if len(cluster) < min_count:
+        return False
+    return cluster[-1]["time"] - cluster[0]["time"] >= min_span
+
+
+def _filter_noisy_segments(segments: list[dict]) -> list[dict]:
+    noisy_indexes = set()
+    for index, segment in enumerate(segments):
+        if _is_noisy_segment(segment):
+            noisy_indexes.add(index)
+    noisy_indexes.update(_find_noisy_similarity_cluster_indexes(segments, noisy_indexes))
+
+    filtered = []
+    for index, segment in enumerate(segments):
+        if index in noisy_indexes:
+            continue
+        filtered.append(segment)
+    return filtered
+
+
+def _dedupe_adjacent_segments(
+    segments: list[dict],
+    max_gap: float = 0.12,
+    similarity_threshold: float = 0.82,
+) -> list[dict]:
+    deduped = []
+    current = None
+    for segment in segments:
+        if current and _segments_are_duplicate(current, segment, max_gap, similarity_threshold):
+            current["end"] = max(float(current["end"]), float(segment["end"]))
+            current["confidence"] = max(float(current.get("confidence", 0.0)), float(segment.get("confidence", 0.0)))
+            if len(str(segment.get("text", ""))) > len(str(current.get("text", ""))):
+                current["text"] = segment["text"]
+            continue
+        if current:
+            current["duration"] = float(current["end"]) - float(current["start"])
+            deduped.append(current)
+        current = dict(segment)
+    if current:
+        current["duration"] = float(current["end"]) - float(current["start"])
+        deduped.append(current)
+    return deduped
+
+
+def _segments_are_duplicate(
+    first: dict,
+    second: dict,
+    max_gap: float,
+    similarity_threshold: float,
+) -> bool:
+    gap = float(second.get("start", 0.0)) - float(first.get("end", 0.0))
+    if gap > max_gap:
+        return False
+    first_text = str(first.get("text", ""))
+    second_text = str(second.get("text", ""))
+    if _similar(first_text, second_text) >= similarity_threshold:
+        return True
+    return _cyclic_text_similarity(first_text, second_text) >= similarity_threshold
+
+
+def _cyclic_text_similarity(first: str, second: str) -> float:
+    if not first or not second or len(first) != len(second):
+        return 0.0
+    doubled = first + first
+    best = 0.0
+    for start in range(len(first)):
+        candidate = doubled[start:start + len(first)]
+        best = max(best, _similar(candidate, second))
+    return best
+
+
+def _is_noisy_segment(segment: dict) -> bool:
+    text = str(segment.get("text", ""))
+    if not text:
+        return True
+    chinese_count = sum("\u4e00" <= char <= "\u9fff" for char in text)
+    ascii_noise_count = sum(char.isascii() and (char.isalnum() or not char.isspace()) for char in text)
+    latin_digit_count = sum(char.isascii() and char.isalnum() for char in text)
+    if chinese_count >= 2 and latin_digit_count >= 2:
+        return True
+    if ascii_noise_count and ascii_noise_count >= max(2, chinese_count):
+        return True
+    if any(char in text for char in "&@#$%^*_+=<>\\|~"):
+        return True
+    duration = float(segment.get("end", 0.0)) - float(segment.get("start", 0.0))
+    confidence = float(segment.get("confidence", 0.0))
+    if duration < 0.35 and len(text) <= 3 and confidence < 0.99:
+        return True
+    return False
+
+
+def _find_noisy_similarity_cluster_indexes(
+    segments: list[dict],
+    seed_indexes: set[int],
+    window_seconds: float = 5.0,
+    min_cluster_size: int = 3,
+) -> set[int]:
+    cluster_indexes: set[int] = set()
+    for seed_index in sorted(seed_indexes):
+        seed = segments[seed_index]
+        seed_start = float(seed.get("start", 0.0))
+        seed_text = _normalize_noise_text(str(seed.get("text", "")))
+        if not seed_text:
+            continue
+        candidates = []
+        for index, segment in enumerate(segments):
+            start = float(segment.get("start", 0.0))
+            if start < seed_start - 0.05 or start - seed_start > window_seconds:
+                continue
+            text = _normalize_noise_text(str(segment.get("text", "")))
+            if not text:
+                continue
+            if _texts_are_noise_similar(seed_text, text):
+                candidates.append(index)
+        if len(candidates) >= min_cluster_size:
+            cluster_indexes.update(candidates)
+    return cluster_indexes
+
+
+def _texts_are_noise_similar(a: str, b: str) -> bool:
+    if a in b or b in a:
+        return True
+    return _similar(a, b) >= 0.55
+
+
+def _normalize_noise_text(text: str) -> str:
+    return "".join(char for char in text if "\u4e00" <= char <= "\u9fff")
 
 
 def _finalize(segment: dict, sample_interval: float) -> dict:

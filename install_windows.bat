@@ -171,6 +171,8 @@ call :run_python_check "Verify transformers remains 4.x" "import transformers; v
 
 echo.
 echo [Step 9/11] Setting up vocal separation environment...
+echo  [INFO] separation_env is intentionally separate from trans_env and ocr_env.
+echo         Do not install PaddleOCR or main torch dependencies into separation_env.
 if exist "%SEP_PY%" (
     echo  [OK] Separation environment already exists: %SEP_ENV_DIR%
 ) else (
@@ -201,6 +203,8 @@ echo  [OK] audio-separator[cpu] installed in separation_env
 echo.
 echo.
 echo [Step 10/11] Setting up OCR environment...
+echo  [INFO] ocr_env is intentionally separate from trans_env and separation_env.
+echo         Do not install audio-separator or main torch dependencies into ocr_env.
 if exist "%OCR_PY%" (
     echo  [OK] OCR environment already exists: %OCR_ENV_DIR%
 ) else (

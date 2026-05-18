@@ -11,25 +11,41 @@ from audio_separation import SeparationResult, separate_vocals_and_background
 from asr_recognition import transcribe_chinese_audio
 from ocr_recognition import get_ocr_subtitle_segments
 from pipeline_cache import PipelineRun, atomic_write_json, is_stage_complete, mark_stage_complete
+from stage_validators import (
+    validate_audio_stage,
+    validate_segments_list,
+    validate_recognition_stage,
+    validate_composition_stage,
+    validate_speaker_gender_stage,
+    validate_translation_stage,
+)
 from translation_cache import translate_segments_with_cache, translate_text_with_google
 
 
-def get_or_create_audio_stage(run: PipelineRun, input_video_path: str) -> SeparationResult:
+def get_or_create_audio_stage(
+    run: PipelineRun,
+    input_video_path: str,
+    video_duration: float | None = None,
+) -> SeparationResult:
     stage_dir = run.stage_dir("audio")
     background_path = stage_dir / "background.wav"
     dialogue_path = stage_dir / "dialogue.wav"
 
     if is_stage_complete(run, "audio", [background_path, dialogue_path]):
-        print(f"  - 复用音频分离阶段: {stage_dir}")
-        return SeparationResult(
-            vocals_path="",
-            dialogue_path=str(dialogue_path),
-            background_path=str(background_path),
-            work_dir=str(stage_dir),
-            source_audio_path="",
-            owns_work_dir=False,
-        )
+        valid, reason = validate_audio_stage(background_path, dialogue_path, expected_duration=video_duration)
+        if valid:
+            print(f"  - 复用音频分离阶段: {stage_dir}")
+            return SeparationResult(
+                vocals_path="",
+                dialogue_path=str(dialogue_path),
+                background_path=str(background_path),
+                work_dir=str(stage_dir),
+                source_audio_path="",
+                owns_work_dir=False,
+            )
+        print(f"  - 音频分离阶段无效，重新生成: {reason}")
 
+    _reset_stage_dir(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     work_dir = stage_dir / "_work"
     result = separate_vocals_and_background(input_video_path, work_dir=str(work_dir))
@@ -37,6 +53,9 @@ def get_or_create_audio_stage(run: PipelineRun, input_video_path: str) -> Separa
     shutil.copy2(result.dialogue_path, dialogue_path)
 
     result.cleanup()
+    valid, reason = validate_audio_stage(background_path, dialogue_path, expected_duration=video_duration)
+    if not valid:
+        raise RuntimeError(f"音频分离产物无效: {reason}")
     mark_stage_complete(
         run,
         "audio",
@@ -68,9 +87,13 @@ def get_or_create_recognition_stage(
     text_path = stage_dir / "recognized_text.txt"
 
     if is_stage_complete(run, "recognition", [segments_path, text_path]):
-        print(f"  - 复用文本识别阶段: {stage_dir}")
-        return json.loads(segments_path.read_text(encoding="utf-8"))
+        valid, reason = validate_recognition_stage(segments_path, text_path, video_duration=video_duration)
+        if valid:
+            print(f"  - 复用文本识别阶段: {stage_dir}")
+            return json.loads(segments_path.read_text(encoding="utf-8"))
+        print(f"  - 文本识别阶段无效，重新生成: {reason}")
 
+    _reset_stage_dir(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     ocr_segments = get_ocr_subtitle_segments(
         input_video_path,
@@ -88,6 +111,9 @@ def get_or_create_recognition_stage(
         segments = transcribe_chinese_audio(asr_audio_path)
         source = "asr"
 
+    valid, reason = validate_segments_list(segments, video_duration=video_duration)
+    if not valid:
+        raise RuntimeError(f"文本识别产物无效: {reason}")
     atomic_write_json(segments_path, segments)
     _atomic_write_text(text_path, _format_segments_text(segments))
     mark_stage_complete(run, "recognition", {"source": source, "outputs": [str(segments_path), str(text_path)]})
@@ -104,10 +130,14 @@ def get_or_create_translation_stage(
     stage_dir = run.stage_dir("translation")
     translated_path = stage_dir / "translated_segments.json"
     text_path = stage_dir / "translated_text.txt"
+    pending_path = stage_dir / "translation_pending.json"
 
     if is_stage_complete(run, "translation", [translated_path, text_path]):
-        print(f"  - 复用翻译阶段: {stage_dir}")
-        return json.loads(translated_path.read_text(encoding="utf-8"))
+        valid, reason = validate_translation_stage(translated_path, text_path, pending_path, segments)
+        if valid:
+            print(f"  - 复用翻译阶段: {stage_dir}")
+            return json.loads(translated_path.read_text(encoding="utf-8"))
+        print(f"  - 翻译阶段需要回补/重建: {reason}")
 
     started = time.time()
     results = translate_segments_with_cache(
@@ -117,6 +147,9 @@ def get_or_create_translation_stage(
         translator=translator,
         max_workers=max_workers,
     )
+    valid, reason = validate_translation_stage(translated_path, text_path, pending_path, segments)
+    if not valid:
+        print(f"  - 翻译阶段仍有问题，流程继续: {reason}")
     mark_stage_complete(
         run,
         "translation",
@@ -132,11 +165,18 @@ def get_or_create_speaker_gender_stage(run: PipelineRun, wait_func) -> dict:
     stage_dir = run.stage_dir("speaker_gender")
     output_path = stage_dir / "speaker_gender.json"
     if is_stage_complete(run, "speaker_gender", [output_path]):
-        print(f"  - 复用说话人/男女声阶段: {stage_dir}")
-        return json.loads(output_path.read_text(encoding="utf-8"))
+        valid, reason = validate_speaker_gender_stage(output_path)
+        if valid:
+            print(f"  - 复用说话人/男女声阶段: {stage_dir}")
+            return json.loads(output_path.read_text(encoding="utf-8"))
+        print(f"  - 说话人/男女声阶段无效，重新生成: {reason}")
 
+    _reset_stage_dir(stage_dir)
     speaker_map = wait_func()
     atomic_write_json(output_path, speaker_map)
+    valid, reason = validate_speaker_gender_stage(output_path)
+    if not valid:
+        raise RuntimeError(f"说话人/男女声产物无效: {reason}")
     mark_stage_complete(run, "speaker_gender", {"outputs": [str(output_path)]})
     return speaker_map
 
@@ -162,6 +202,9 @@ def mark_tts_stage_complete(
 
 
 def mark_composition_stage_complete(run: PipelineRun, output_video_path: str) -> None:
+    valid, reason = validate_composition_stage(output_video_path)
+    if not valid:
+        raise RuntimeError(f"最终合成产物无效: {reason}")
     mark_stage_complete(run, "composition", {"outputs": [output_video_path]})
 
 
@@ -179,3 +222,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(text, encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _reset_stage_dir(stage_dir: Path) -> None:
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)

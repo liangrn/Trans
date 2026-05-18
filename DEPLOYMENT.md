@@ -4,13 +4,14 @@
 
 ## 1. 当前部署原则
 
-1. 统一 CPU-only，不再提供 CUDA / GPU 安装分支。
+1. 统一 CPU-only，不再提供显卡加速安装分支。
 2. 所有视频处理必须先做人声分离。
 3. 文本识别优先使用硬字幕 OCR；OCR 结果可用时跳过 ASR。
 4. 无可用硬字幕时，使用主环境中的 `faster-whisper` 兜底识别，不再安装独立 ASR 环境。
 5. 部署目录必须完整携带 `voice-gender-classifier/`。
 6. 在线翻译保留，旧的 `本地翻译版本/` 已移除。
 7. 配音输出使用“分离背景音 + TTS 配音”，不会主动混入原视频完整音轨。
+8. `separation_env` 和 `ocr_env` 不合并：前者只用于 `audio-separator[cpu]`，后者只用于 PaddleOCR，避免 ONNX/Paddle/OpenCV 在 Windows 上互相污染。
 
 ## 2. 最小部署目录
 
@@ -81,7 +82,7 @@ install_windows.bat
 
 - 使用英语 VITS 声音时，需要先安装 `espeak-ng`
 - 说话人分离功能需要设置 `HF_TOKEN`
-- 不再需要 NVIDIA/CUDA/显卡驱动匹配
+- 不再需要 NVIDIA 显卡驱动匹配
 
 ## 4. HuggingFace 配置
 
@@ -108,15 +109,15 @@ setx HF_TOKEN "hf_xxx"
 
 ### 5.1 基础导入检查
 
-```bash
-python -m py_compile video_dubbing.py video_subtitles_only.py speaker_aware_dubbing.py gender_classifier.py test_diarization.py
+```bat
+trans_env\Scripts\python -m py_compile video_dubbing.py video_subtitles_only.py speaker_aware_dubbing.py gender_classifier.py test_diarization.py
 ```
 
 ### 5.2 查看 help
 
-```bash
-python video_dubbing.py --help
-python video_subtitles_only.py --help
+```bat
+trans_env\Scripts\python video_dubbing.py --help
+trans_env\Scripts\python video_subtitles_only.py --help
 ```
 
 ### 5.3 性别模型目录检查
@@ -134,11 +135,15 @@ voice-gender-classifier/README.md
 separation_env\Scripts\audio-separator.exe --env_info
 ```
 
+`separation_env` 只安装 `audio-separator[cpu]` 和它需要的运行依赖，不要把 PaddleOCR 或主流程依赖装进去。
+
 ### 5.5 OCR 环境检查
 
 ```bat
 ocr_env\Scripts\python -c "from paddleocr import PaddleOCR; import cv2; print('PaddleOCR OK')"
 ```
+
+`ocr_env` 只安装 PaddleOCR / PaddlePaddle / OpenCV，不要把 `audio-separator[cpu]` 或主流程 torch 依赖装进去。
 
 ### 5.6 ASR 兜底检查
 

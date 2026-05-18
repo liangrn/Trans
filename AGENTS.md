@@ -48,12 +48,12 @@ python test_diarization.py input/video.mp4 --num-speakers 4  # Force exact speak
 ### Processing Pipeline (video_dubbing.py)
 
 ```
-[1/6] ASR (faster-whisper)          → Extract text segments with timestamps
-[2/6] Speaker Diarization (async)   → pyannote speaker separation (runs in parallel with ASR)
-[3/6] Gender Recognition            → ECAPA-TDNN model + F0 fallback
-[4/6] Translation                   → Google Translate via deep_translator
-[5/6] TTS Generation                → Multi-voice synthesis (male/female voices)
-[6/6] Video Composition             → MoviePy + FFmpeg final output
+[0/6] Vocal Separation              → audio-separator in separation_env creates background/dialogue tracks
+[1/6] Text Recognition              → OCR first via ocr_env; faster-whisper in trans_env only as fallback
+[2/6] Speaker + Gender Analysis     → pyannote + ECAPA/F0 on dialogue audio
+[3/6] Translation                   → Google Translate via deep_translator
+[4/6] TTS Generation                → Multi-voice synthesis (male/female voices)
+[5/6] Video Composition             → MoviePy + FFmpeg final output
 ```
 
 ### Key Modules
@@ -109,11 +109,13 @@ Uses FFmpeg concat demuxer for lossless, fast merging. Requires videos to have i
 ## Dependencies
 
 ### Core
-- `faster-whisper`, CPU `torch` (ASR)
+- `faster-whisper` in the main environment (ASR fallback when OCR is unusable)
 - `deep_translator` (Google Translate)
 - `coqui-tts`, `transformers`, CPU `torch` (Coqui TTS for voice synthesis)
 - `moviepy`, `PIL/Pillow` (video/image processing)
 - `ffmpeg`, `ffprobe` (external binaries)
+- `audio-separator[cpu]` in `separation_env` (vocal/background separation)
+- `paddleocr`, `paddlepaddle`, `opencv-python-headless` in `ocr_env` (hard subtitle OCR)
 
 ### Speaker Analysis
 - `pyannote.audio` (speaker diarization)

@@ -9,11 +9,7 @@ from deep_translator import GoogleTranslator
 from PIL import Image, ImageDraw, ImageFont
 from ocr_recognition import get_ocr_subtitle_segments
 from pipeline_cache import get_pipeline_run
-from pipeline_stages import (
-    get_or_create_audio_stage,
-    get_or_create_recognition_stage,
-    get_or_create_translation_stage,
-)
+from pipeline_stages import get_or_create_recognition_stage, get_or_create_translation_stage
 import warnings
 try:
     from moviepy.editor import VideoFileClip, CompositeVideoClip
@@ -764,7 +760,6 @@ def process_single_video(input_video_path, target_language, output_video_path, p
     
     original_video = None
     final_clip = None
-    separation_result = None
     subtitle_clips = []
     temp_files_to_delete = []
     
@@ -788,28 +783,12 @@ def process_single_video(input_video_path, target_language, output_video_path, p
         print("\n[1/3] 文本识别...")
         
         try:
-            with ThreadPoolExecutor(max_workers=2) as stage_executor:
-                audio_future = stage_executor.submit(
-                    get_or_create_audio_stage, pipeline_run, input_video_path
-                )
-                recognition_future = stage_executor.submit(
-                    get_or_create_recognition_stage,
-                    pipeline_run,
-                    input_video_path,
-                    video_duration,
-                    None,
-                )
-                try:
-                    segments = recognition_future.result()
-                    separation_result = audio_future.result()
-                except Exception:
-                    separation_result = audio_future.result()
-                    segments = get_or_create_recognition_stage(
-                        pipeline_run,
-                        input_video_path,
-                        video_duration,
-                        separation_result.dialogue_path,
-                    )
+            segments = get_or_create_recognition_stage(
+                pipeline_run,
+                input_video_path,
+                video_duration,
+                input_video_path,
+            )
             
             original_segments_data = []
             for segment in segments:
@@ -961,12 +940,6 @@ def process_single_video(input_video_path, target_language, output_video_path, p
                 except:
                     pass
 
-            if separation_result:
-                try:
-                    separation_result.cleanup()
-                except:
-                    pass
-            
             # 强制垃圾回收
             gc.collect()
             

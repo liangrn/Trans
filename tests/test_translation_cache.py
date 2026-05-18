@@ -1,5 +1,7 @@
 import json
 
+from pipeline_cache import get_pipeline_run, mark_stage_complete
+from pipeline_stages import get_or_create_translation_stage
 from translation_cache import translate_segments_with_cache
 
 
@@ -89,3 +91,48 @@ def test_translation_pending_is_recovered_on_next_run(tmp_path):
     pending = json.loads((tmp_path / "translation_pending.json").read_text(encoding="utf-8"))
     assert recovered[0]["translated"] == "Recovered"
     assert pending == []
+
+
+def test_translation_stage_retries_pending_even_when_stage_done(tmp_path):
+    attempts = {"count": 0}
+
+    def translator(text, target_lang):
+        attempts["count"] += 1
+        if attempts["count"] <= 5:
+            raise RuntimeError("temporary")
+        return "Recovered"
+
+    input_video = tmp_path / "input.mp4"
+    input_video.write_bytes(b"video")
+    run = get_pipeline_run(
+        input_video_path=str(input_video),
+        output_video_path=str(tmp_path / "out.mp4"),
+        target_language="en",
+        selected_voice_key="voice",
+        extra_params={},
+    )
+    segments = [{"text": "先失败", "start": 0.0, "end": 1.0, "duration": 1.0}]
+
+    first = get_or_create_translation_stage(
+        run,
+        segments,
+        "en",
+        translator=translator,
+        max_workers=1,
+    )
+    mark_stage_complete(run, "translation", {"outputs": [
+        str(run.stage_dir("translation") / "translated_segments.json"),
+        str(run.stage_dir("translation") / "translated_text.txt"),
+    ]})
+
+    second = get_or_create_translation_stage(
+        run,
+        segments,
+        "en",
+        translator=translator,
+        max_workers=1,
+    )
+
+    assert first[0]["fallback_original"] is True
+    assert second[0]["translated"] == "Recovered"
+    assert json.loads((run.stage_dir("translation") / "translation_pending.json").read_text(encoding="utf-8")) == []
