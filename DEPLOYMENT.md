@@ -1,13 +1,16 @@
 # 部署文档
 
-本文档描述当前版本在 Windows 和 macOS 上的推荐部署方式。目标是降低新环境安装失败率，因此当前版本统一采用 CPU-only 方案。
+本文档描述当前版本在 Windows 上的推荐部署方式。目标是降低新环境安装失败率，因此当前版本统一采用 CPU-only 方案。
 
 ## 1. 当前部署原则
 
 1. 统一 CPU-only，不再提供 CUDA / GPU 安装分支。
-2. 部署目录必须完整携带 `voice-gender-classifier/`。
-3. 在线翻译保留，旧的 `本地翻译版本/` 已移除。
-4. 默认配音行为是“静音背景 + TTS 配音”，不会保留原视频人声。
+2. 所有视频处理必须先做人声分离。
+3. 文本识别优先使用硬字幕 OCR；OCR 结果可用时跳过 ASR。
+4. 无可用硬字幕时，使用主环境中的 `faster-whisper` 兜底识别，不再安装独立 ASR 环境。
+5. 部署目录必须完整携带 `voice-gender-classifier/`。
+6. 在线翻译保留，旧的 `本地翻译版本/` 已移除。
+7. 配音输出使用“分离背景音 + TTS 配音”，不会主动混入原视频完整音轨。
 
 ## 2. 最小部署目录
 
@@ -19,10 +22,16 @@ Trans/
 ├── video_subtitles_only.py
 ├── speaker_aware_dubbing.py
 ├── gender_classifier.py
+├── audio_separation.py
+├── asr_recognition.py
+├── ocr_recognition.py
+├── ocr_subtitle_probe.py
 ├── test_diarization.py
 ├── requirements.txt
 ├── README.md
 ├── install_windows.bat
+├── separation_env/          # 可重新创建；用于 audio-separator
+├── ocr_env/                 # 可重新创建；用于 PaddleOCR
 └── voice-gender-classifier/
     ├── model.py
     ├── README.md
@@ -61,8 +70,10 @@ install_windows.bat
 3. 固定安装 `numpy<2`
 4. 从 `https://download.pytorch.org/whl/cpu` 安装 CPU 版 `torch/torchaudio/torchvision`
 5. 安装 `onnxruntime`
-6. 安装 `coqui-tts` 与其余依赖
-7. 验证关键模块可导入，并检查主脚本 `--help`
+6. 安装 `faster-whisper`、`coqui-tts` 与其余依赖
+7. 创建 `separation_env`，安装 `audio-separator[cpu]`
+8. 创建 `ocr_env`，安装 `PaddleOCR`
+9. 验证关键模块可导入，并检查主脚本 `--help`、`audio-separator --env_info` 和 PaddleOCR import
 
 脚本会在项目根目录生成 `install_windows.log`。安装失败时，优先查看这个日志。
 
@@ -72,34 +83,7 @@ install_windows.bat
 - 说话人分离功能需要设置 `HF_TOKEN`
 - 不再需要 NVIDIA/CUDA/显卡驱动匹配
 
-## 4. macOS 部署
-
-### 4.1 环境要求
-
-- macOS 13+
-- Python 3.10 或 3.11
-- `ffmpeg` 可用
-
-### 4.2 推荐安装方式
-
-建议使用 conda：
-
-```bash
-conda create -n iai python=3.10 -y
-conda activate iai
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install "numpy>=1.24.0,<2.0.0"
-python -m pip install "torch>=2.3.0,<2.4.0" "torchaudio>=2.3.0,<2.4.0"
-python -m pip install -r requirements.txt
-```
-
-如果系统没有 `ffmpeg`，先安装：
-
-```bash
-brew install ffmpeg
-```
-
-## 5. HuggingFace 配置
+## 4. HuggingFace 配置
 
 说话人分离使用 `pyannote/speaker-diarization-3.1`，首次使用前需要：
 
@@ -120,22 +104,22 @@ Windows：
 setx HF_TOKEN "hf_xxx"
 ```
 
-## 6. 验证部署是否完整
+## 5. 验证部署是否完整
 
-### 6.1 基础导入检查
+### 5.1 基础导入检查
 
 ```bash
 python -m py_compile video_dubbing.py video_subtitles_only.py speaker_aware_dubbing.py gender_classifier.py test_diarization.py
 ```
 
-### 6.2 查看 help
+### 5.2 查看 help
 
 ```bash
 python video_dubbing.py --help
 python video_subtitles_only.py --help
 ```
 
-### 6.3 性别模型目录检查
+### 5.3 性别模型目录检查
 
 确认以下文件存在：
 
@@ -144,9 +128,27 @@ voice-gender-classifier/model.py
 voice-gender-classifier/README.md
 ```
 
-## 7. 常见部署问题
+### 5.4 人声分离环境检查
 
-### 7.1 缺少 `voice-gender-classifier/model.py`
+```bat
+separation_env\Scripts\audio-separator.exe --env_info
+```
+
+### 5.5 OCR 环境检查
+
+```bat
+ocr_env\Scripts\python -c "from paddleocr import PaddleOCR; import cv2; print('PaddleOCR OK')"
+```
+
+### 5.6 ASR 兜底检查
+
+```bat
+trans_env\Scripts\python -c "from faster_whisper import WhisperModel; print('faster-whisper OK')"
+```
+
+## 6. 常见部署问题
+
+### 6.1 缺少 `voice-gender-classifier/model.py`
 
 现象：
 
@@ -157,7 +159,7 @@ voice-gender-classifier/README.md
 原因：部署包不完整。  
 修复：把整个 `voice-gender-classifier/` 目录一起复制。
 
-### 7.2 `numpy 2.x detected`
+### 6.2 `numpy 2.x detected`
 
 原因：某些包把 numpy 升到了 2.x。  
 修复：
@@ -166,12 +168,12 @@ voice-gender-classifier/README.md
 pip install --force-reinstall "numpy>=1.24.0,<2.0.0"
 ```
 
-### 7.3 `No espeak backend found`
+### 6.3 `No espeak backend found`
 
 原因：使用英语 VITS 声音，但未安装 `espeak-ng`。  
 修复：安装 `espeak-ng`，然后重新打开终端。
 
-### 7.4 `401 Unauthorized` / `Repository not found`
+### 6.4 `401 Unauthorized` / `Repository not found`
 
 原因：`HF_TOKEN` 未设置、无效，或未先同意 pyannote 模型协议。  
 修复：重新配置 token，并确认已同意模型协议。

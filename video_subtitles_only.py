@@ -5,9 +5,15 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import tempfile
 import argparse
 import textwrap
-from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 from PIL import Image, ImageDraw, ImageFont
+from ocr_recognition import get_ocr_subtitle_segments
+from pipeline_cache import get_pipeline_run
+from pipeline_stages import (
+    get_or_create_audio_stage,
+    get_or_create_recognition_stage,
+    get_or_create_translation_stage,
+)
 import warnings
 try:
     from moviepy.editor import VideoFileClip, CompositeVideoClip
@@ -758,6 +764,7 @@ def process_single_video(input_video_path, target_language, output_video_path, p
     
     original_video = None
     final_clip = None
+    separation_result = None
     subtitle_clips = []
     temp_files_to_delete = []
     
@@ -768,40 +775,53 @@ def process_single_video(input_video_path, target_language, output_video_path, p
         video_height = original_video.h
         
         print(f"视频时长: {video_duration:.2f}s")
+
+        pipeline_run = get_pipeline_run(
+            input_video_path=input_video_path,
+            output_video_path=output_video_path,
+            target_language=target_language,
+            selected_voice_key=None,
+            extra_params={"parallel": parallel, "workers": workers, "mode": "subtitles"},
+        )
         
-        # ========== 1. 语音识别 (ASR) ==========
-        print("\n[1/3] 语音识别 (ASR)...")
-        model_size = "medium"
-        device = "cpu"
-        compute_type = "float32"
+        # ========== 1. 文本识别（优先 OCR 硬字幕） ==========
+        print("\n[1/3] 文本识别...")
         
         try:
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
-            segments, info = model.transcribe(
-                input_video_path,
-                language="zh",
-                task="transcribe",
-                beam_size=5,
-                best_of=5,
-                word_timestamps=True,  # 启用词级时间戳，提高时间精度
-                vad_filter=True,       # 启用 VAD 过滤非语音片段
-                vad_parameters={
-                    "min_silence_duration_ms": 500,  # 最小静音时长
-                    "speech_pad_ms": 200,            # 语音前后填充
-                }
-            )
+            with ThreadPoolExecutor(max_workers=2) as stage_executor:
+                audio_future = stage_executor.submit(
+                    get_or_create_audio_stage, pipeline_run, input_video_path
+                )
+                recognition_future = stage_executor.submit(
+                    get_or_create_recognition_stage,
+                    pipeline_run,
+                    input_video_path,
+                    video_duration,
+                    None,
+                )
+                try:
+                    segments = recognition_future.result()
+                    separation_result = audio_future.result()
+                except Exception:
+                    separation_result = audio_future.result()
+                    segments = get_or_create_recognition_stage(
+                        pipeline_run,
+                        input_video_path,
+                        video_duration,
+                        separation_result.dialogue_path,
+                    )
             
             original_segments_data = []
             for segment in segments:
-                if segment.start >= video_duration:
+                if segment["start"] >= video_duration:
                     continue
-                actual_end = min(segment.end, video_duration)
-                duration = actual_end - segment.start
+                actual_end = min(segment["end"], video_duration)
+                duration = actual_end - segment["start"]
                 if duration < 0.3:
                     continue
                 original_segments_data.append({
-                    "text": segment.text.strip(),
-                    "start": segment.start,
+                    "text": segment["text"].strip(),
+                    "start": segment["start"],
                     "end": actual_end,
                     "duration": duration
                 })
@@ -837,59 +857,35 @@ def process_single_video(input_video_path, target_language, output_video_path, p
             if i + 1 < len(original_segments_data):
                 next_starts[i] = original_segments_data[i + 1]["start"]
 
-        if parallel and len(original_segments_data) > 1:
-            # 并行翻译
-            translated_results = translate_segments_parallel(
-                original_segments_data, target_language, max_workers=workers
-            )
-            # 按原始顺序排好（translate_segments_parallel 已保序）
-            sorted_results = sorted(translated_results, key=lambda r: r["idx"])
+        translated_results = get_or_create_translation_stage(
+            pipeline_run,
+            original_segments_data,
+            target_language,
+            max_workers=workers if parallel else 1,
+        )
+        sorted_results = sorted(translated_results, key=lambda r: r["idx"])
 
-            for i, result in enumerate(sorted_results):
-                try:
-                    sub_dur = _calc_subtitle_duration(
-                        result["translated"], result["duration"], result["start"],
-                        next_starts.get(i)
-                    )
-                    sub_clip = create_subtitle_clip(
-                        result["translated"],
-                        result["start"],
-                        sub_dur,
-                        video_width,
-                        video_height,
-                        target_language
-                    )
-                    subtitle_clips.append(sub_clip)
-                    if hasattr(sub_clip, 'temp_path') and sub_clip.temp_path:
-                        temp_files_to_delete.append(sub_clip.temp_path)
-                except Exception as e:
-                    print(f" - 字幕生成失败: {e}")
-        else:
-            # 顺序翻译（并行禁用或只有一个片段）
-            for i, seg in enumerate(original_segments_data):
-                translated_text = translate_text(seg["text"], target_language)
-                print(f" [{i+1}] {seg['text'][:30]}... -> {translated_text[:30]}...")
-                try:
-                    sub_dur = _calc_subtitle_duration(
-                        translated_text, seg["duration"], seg["start"],
-                        next_starts.get(i)
-                    )
-                    sub_clip = create_subtitle_clip(
-                        translated_text,
-                        seg["start"],
-                        sub_dur,
-                        video_width,
-                        video_height,
-                        target_language
-                    )
-                    subtitle_clips.append(sub_clip)
-                    if hasattr(sub_clip, 'temp_path') and sub_clip.temp_path:
-                        temp_files_to_delete.append(sub_clip.temp_path)
-                except Exception as e:
-                    print(f" - 字幕生成失败: {e}")
+        for i, result in enumerate(sorted_results):
+            try:
+                sub_dur = _calc_subtitle_duration(
+                    result["translated"], result["duration"], result["start"],
+                    next_starts.get(i)
+                )
+                sub_clip = create_subtitle_clip(
+                    result["translated"],
+                    result["start"],
+                    sub_dur,
+                    video_width,
+                    video_height,
+                    target_language
+                )
+                subtitle_clips.append(sub_clip)
+                if hasattr(sub_clip, 'temp_path') and sub_clip.temp_path:
+                    temp_files_to_delete.append(sub_clip.temp_path)
+            except Exception as e:
+                print(f" - 字幕生成失败: {e}")
         
-        # 释放ASR模型内存（翻译完成后立即释放，不等到合成）
-        del model
+        # 释放 ASR 相关内存
         gc.collect()
 
         # ========== 3. 合成视频 ==========
@@ -962,6 +958,12 @@ def process_single_video(input_video_path, target_language, output_video_path, p
                 try:
                     if os.path.exists(temp_path):
                         _safe_remove(temp_path)
+                except:
+                    pass
+
+            if separation_result:
+                try:
+                    separation_result.cleanup()
                 except:
                     pass
             

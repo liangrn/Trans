@@ -1,8 +1,8 @@
 # 视频翻译配音工具依赖
 # ============================================================
 # 版本锁定说明：
-#   - torch 锁定 2.3.x：同时满足 faster-whisper>=1.0、pyannote.audio>=3.1、
-#     以及 speechbrain 对 torch 的要求。
+#   - torch 锁定 2.3.x：同时满足 pyannote.audio>=3.1、speechbrain、
+#     coqui-tts 对 torch 的要求。
 #   - TTS 改用 coqui-tts（社区维护 fork），已发布支持 torch 2.x 的 wheel，
 #     Windows 无需本地编译 C 扩展。
 #   - numpy 锁定 <2.0：numpy 2.x 破坏大量 C-API 扩展的 ABI（torch / speechbrain
@@ -13,14 +13,13 @@
 # ============================================================
 
 # ============ 核心深度学习框架 ============
-# torch 2.3.x 是同时满足 faster-whisper 1.x / pyannote.audio 3.1 / speechbrain 的最低公共版本
+# torch 2.3.x 是同时满足 pyannote.audio 3.1 / speechbrain / coqui-tts 的稳定 CPU 版本
 torch>=2.3.0,<2.4.0
 torchaudio>=2.3.0,<2.4.0
 
 # ============ ASR 语音识别 ============
-faster-whisper>=1.0.0,<2.0.0
-# CPU-only ASR runtime for simpler Windows setup
-onnxruntime>=1.17.0,<2.0.0
+# OCR 硬字幕优先；无可用字幕时使用 faster-whisper 兜底。
+faster-whisper>=1.1.0,<2.0.0
 
 # ============ torchvision（链式依赖锁定，防止拉到与 torch 不匹配的版本）============
 # torch 2.3.x 严格对应 torchvision 0.18.x；版本不匹配会导致 torchvision::nms 不存在

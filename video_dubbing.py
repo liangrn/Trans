@@ -18,8 +18,6 @@ except ImportError:
         "coqui-tts 是 Coqui TTS 的社区维护 fork，支持 torch 2.x 且 Windows 有预编译 wheel。"
     )
 
-from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator
 import torch
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,6 +35,17 @@ except ImportError as _mpy_err:
     )
 
 from PIL import Image, ImageDraw, ImageFont
+from pipeline_cache import get_pipeline_run
+from pipeline_cache import is_stage_complete
+from pipeline_stages import (
+    get_or_create_audio_stage,
+    get_or_create_recognition_stage,
+    get_or_create_speaker_gender_stage,
+    get_or_create_translation_stage,
+    mark_composition_stage_complete,
+    mark_tts_stage_complete,
+)
+from tts_timeline import build_tts_timeline, finalize_tts_timeline
 
 warnings.filterwarnings("ignore", message="You are sending unauthenticated requests to the HF Hub")
 
@@ -45,7 +54,6 @@ try:
     from speaker_aware_dubbing import (
         run_diarization_async,
         wait_diarization,
-        analyze_speakers_for_video,
         build_speaker_voice_map,
         get_voice_for_segment,
     )
@@ -146,6 +154,7 @@ def run_ffmpeg_cmd(cmd_list):
         print(f"FFmpeg 错误: {stderr}")
         raise e
 
+
 def adjust_audio_speed_ffmpeg(input_file, output_file, target_duration, max_speed_factor=2.0, min_speed_factor=0.5):
     """
     调整音频速度：
@@ -217,6 +226,71 @@ def adjust_audio_speed_ffmpeg(input_file, output_file, target_duration, max_spee
         import shutil
         shutil.copy(input_file, output_file)
         return original_duration, 1.0
+
+
+def _probe_audio_duration(audio_path: str) -> float:
+    clip = AudioFileClip(audio_path)
+    try:
+        return float(clip.duration or 0.0)
+    finally:
+        clip.close()
+
+
+def _extend_video_with_frozen_tail(
+    video_clip,
+    source_video_path: str,
+    target_duration: float,
+    frozen_frame_path: str,
+):
+    if target_duration <= video_clip.duration + 0.05:
+        return video_clip
+
+    fps = video_clip.fps if video_clip.fps else 30
+    freeze_time = max(0.0, video_clip.duration - (1.0 / fps))
+    freeze_duration = target_duration - video_clip.duration
+    os.makedirs(os.path.dirname(frozen_frame_path), exist_ok=True)
+    from moviepy.video.VideoClip import ImageClip
+
+    attempts = [
+        [
+            "ffmpeg", "-y",
+            "-sseof", "-1",
+            "-i", source_video_path,
+            "-update", "1",
+            "-frames:v", "1",
+            frozen_frame_path,
+        ],
+        [
+            "ffmpeg", "-y",
+            "-ss", f"{freeze_time:.3f}",
+            "-i", source_video_path,
+            "-update", "1",
+            "-frames:v", "1",
+            frozen_frame_path,
+        ],
+    ]
+
+    image = None
+    last_error = None
+    for cmd in attempts:
+        try:
+            run_ffmpeg_cmd(cmd)
+            if not os.path.exists(frozen_frame_path) or os.path.getsize(frozen_frame_path) <= 0:
+                raise RuntimeError(f"冻结帧文件未生成: {frozen_frame_path}")
+            image = Image.open(frozen_frame_path).convert("RGB")
+            break
+        except Exception as exc:
+            last_error = exc
+            if os.path.exists(frozen_frame_path):
+                _safe_remove(frozen_frame_path)
+
+    if image is None:
+        raise RuntimeError(f"无法提取视频尾帧: {last_error}")
+
+    frozen_frame = np.array(image)
+    frozen_tail = ImageClip(frozen_frame).set_duration(freeze_duration)
+    frozen_tail.temp_path = frozen_frame_path
+    return concatenate_videoclips([video_clip, frozen_tail], method="chain")
 
 def get_available_coqui_voices():
     """获取可用的 Coqui TTS 声音/模型列表。
@@ -346,117 +420,11 @@ def get_available_coqui_voices():
         "pl_female_001": {"model_name": XTTS_V2, "language": "pl", "description": "XTTS-v2 (波兰语, 女声1, 清晰)"},
     }
     return voices
-def translate_text(text, target_lang):
-    """翻译文本 - 增强版（自动处理繁体中文）"""
-    try:
-        import re
-        # 检测是否包含中文字符（繁体/简体）
-        if re.search(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text):
-            try:
-                from zhconv import convert
-                # 繁体转简体（双重保险：先转简体再翻译）
-                simplified = convert(text, 'zh-cn')
-                if simplified != text:
-                    print(f"    - 繁体转简体: '{text}' -> '{simplified}'")
-                    text = simplified
-            except ImportError:
-                print("    - 未安装 zhconv，繁体中文可能翻译不准确（建议: pip install zhconv）")
-        
-        # Google Translator 兼容性处理
-        if target_lang.startswith('zh'):
-            target_lang = 'zh-CN'
-        
-        translator = GoogleTranslator(source='auto', target=target_lang)
-        result = translator.translate(text)
-        
-        # 验证翻译结果（避免返回原文）
-        if result.strip() == text.strip() and not re.match(r'^[\s\W]+$', text):
-            print(f"    - 警告: 翻译结果与原文相同，可能识别失败")
-            # 尝试强制指定源语言为中文
-            try:
-                translator_zh = GoogleTranslator(source='zh-CN', target=target_lang)
-                result2 = translator_zh.translate(text)
-                if result2.strip() != text.strip():
-                    print(f"    - 回退方案成功: '{text}' -> '{result2}'")
-                    return result2
-            except:
-                pass
-        
-        return result
-    except Exception as e:
-        print(f"  - 翻译失败: {e}")
-        return text  # 回退到原文
-
-
-def translate_segments_parallel(segments, target_lang, max_workers=10, show_progress=True):
-    """并行翻译所有片段
-
-    Args:
-        segments: 片段列表，每个片段包含 text, start, end, duration/original_duration
-        target_lang: 目标语言代码
-        max_workers: 最大并行线程数
-        show_progress: 是否显示进度
-
-    Returns:
-        翻译后的片段列表，保持原始顺序
-    """
-    if not segments:
-        return []
-
-    total = len(segments)
-    completed = [0]  # 使用列表以便在闭包中修改
-
-    def translate_one(seg, idx):
-        """翻译单个片段"""
-        translated = translate_text(seg["text"], target_lang)
-        completed[0] += 1
-        if show_progress and completed[0] % 10 == 0:
-            print(f"  - 翻译进度: {completed[0]}/{total}")
-        return {
-            "idx": idx,
-            "text": seg["text"],
-            "translated": translated,
-            "start": seg["start"],
-            "end": seg["end"],
-            "duration": seg.get("duration") or seg.get("original_duration")
-        }
-
-    print(f"  - 开始并行翻译 {total} 个片段 (线程数: {max_workers})...")
-    start_time = time.time()
-
-    results = [None] * total
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
-        futures = {executor.submit(translate_one, seg, i): i
-                   for i, seg in enumerate(segments)}
-
-        # 收集结果
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                results[result["idx"]] = result
-            except Exception as e:
-                idx = futures[future]
-                print(f"  - 片段 {idx} 翻译失败: {e}")
-                # 使用原文作为回退
-                results[idx] = {
-                    "idx": idx,
-                    "text": segments[idx]["text"],
-                    "translated": segments[idx]["text"],
-                    "start": segments[idx]["start"],
-                    "end": segments[idx]["end"],
-                    "duration": segments[idx].get("duration") or segments[idx].get("original_duration")
-                }
-
-    elapsed = time.time() - start_time
-    print(f"  - 翻译完成: {total} 个片段, 耗时 {elapsed:.1f}s (平均 {elapsed/total:.2f}s/片段)")
-
-    return results
 
 
 def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
-                          max_workers=3, max_speed_factor=2.0, min_speed_factor=0.5):
+                          max_workers=3, max_speed_factor=2.0, min_speed_factor=0.5,
+                          cache_dir=None):
     """并行生成 TTS 音频
 
     TTS 合成在 CPU-only 部署中较耗时，建议使用较小的线程数 (2-3)
@@ -479,6 +447,9 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
     total = len(segments_data)
     temp_files_to_cleanup = []
     results = [None] * total
+    cache_path = Path(cache_dir) if cache_dir else None
+    if cache_path:
+        cache_path.mkdir(parents=True, exist_ok=True)
 
     print(f"  - 开始并行生成 {total} 个 TTS 音频 (线程数: {max_workers})...")
     start_time = time.time()
@@ -487,10 +458,20 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
     def generate_one(seg_data, idx):
         """生成单个 TTS 音频"""
         try:
-            # 创建临时文件
-            tmp_orig = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-            temp_tts_file = tmp_orig.name
-            tmp_orig.close()
+            if cache_path:
+                temp_tts_file = str(cache_path / f"segment_{idx:04d}.wav")
+                if os.path.exists(temp_tts_file) and os.path.getsize(temp_tts_file) > 512:
+                    return {
+                        "idx": idx,
+                        "temp_tts_file": temp_tts_file,
+                        "seg_data": seg_data,
+                        "success": True,
+                        "cached": True,
+                    }
+            else:
+                tmp_orig = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                temp_tts_file = tmp_orig.name
+                tmp_orig.close()
 
             # 生成 TTS
             synthesize_speech_coqui_single(tts_model, speaker_idx,
@@ -505,7 +486,8 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
                 "idx": idx,
                 "temp_tts_file": temp_tts_file,
                 "seg_data": seg_data,
-                "success": True
+                "success": True,
+                "cached": False,
             }
         except Exception as e:
             print(f"    - 片段 {idx} TTS 生成失败: {e}")
@@ -527,7 +509,7 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
                 try:
                     result = future.result()
                     results[result["idx"]] = result
-                    if result["temp_tts_file"]:
+                    if result["temp_tts_file"] and not result.get("cached"):
                         temp_files_to_cleanup.append(result["temp_tts_file"])
                 except Exception as e:
                     idx = futures[future]
@@ -549,7 +531,7 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
         # 降级为顺序处理
         for i, seg_data in enumerate(segments_data):
             results[i] = generate_one(seg_data, i)
-            if results[i]["temp_tts_file"]:
+            if results[i]["temp_tts_file"] and not results[i].get("cached"):
                 temp_files_to_cleanup.append(results[i]["temp_tts_file"])
 
     return results, temp_files_to_cleanup
@@ -1063,12 +1045,15 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
     gc.collect()
     
     original_video = None
+    base_video = None
     final_audio_track = None
     video_with_new_audio = None
     final_video_with_subtitles = None
+    separation_result = None
     final_audio_clips_for_composition = []
     subtitle_clips = []
     temp_files_to_cleanup = []
+    adjusted_tts_files = []
     
     try:
         # 加载原视频
@@ -1078,75 +1063,97 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         video_height = original_video.h
         
         print(f"视频时长: {video_duration:.2f}s")
-        
-        # ===== 在ASR前后台启动说话人分离（与ASR并行）=====
-        if SPEAKER_AWARE_AVAILABLE:
-            _hf_token = os.environ.get('HF_TOKEN', '')
-            if _hf_token:
-                run_diarization_async(input_video_path, _hf_token)
-        # =========================================================
 
-        # Step 1: 语音识别
-        print("\n[1/6] 语音识别...")
-        model_size = "small"
-        device = "cpu"
-        compute_type = "float32"
-        print(f"  - 使用设备: {device}, 计算类型: {compute_type}")
+        pipeline_run = get_pipeline_run(
+            input_video_path=input_video_path,
+            output_video_path=output_video_path,
+            target_language=target_language,
+            selected_voice_key=selected_voice_key,
+            extra_params={
+                "max_speed_factor": max_speed_factor,
+                "min_speed_factor": min_speed_factor,
+                "parallel": parallel,
+                "workers": workers,
+                "tts_workers": tts_workers,
+            },
+        )
+
+        # Step 1: 文本识别（优先 OCR 硬字幕；无可用字幕才跑 ASR）
+        print("\n[1/6] 文本识别...")
         
         try:
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
-            segments, info = model.transcribe(
-                input_video_path,
-                language="zh",
-                task="transcribe",
-                beam_size=10,
-                best_of=5,
-                patience=1.0,
-                word_timestamps=True,  # 启用词级时间戳，提高时间精度
-                vad_filter=True,       # 启用 VAD 过滤非语音片段
-                vad_parameters={
-                    "min_silence_duration_ms": 500,  # 最小静音时长
-                    "speech_pad_ms": 200,            # 语音前后填充
-                }
-            )
+            # OCR 和音频分离互不依赖，先并行启动；只有 OCR 不可用时才等待 dialogue.wav 做 ASR。
+            with ThreadPoolExecutor(max_workers=2) as stage_executor:
+                audio_future = stage_executor.submit(
+                    get_or_create_audio_stage, pipeline_run, input_video_path
+                )
+                recognition_future = stage_executor.submit(
+                    get_or_create_recognition_stage,
+                    pipeline_run,
+                    input_video_path,
+                    video_duration,
+                    None,
+                )
+                try:
+                    segments = recognition_future.result()
+                    separation_result = audio_future.result()
+                except Exception:
+                    separation_result = audio_future.result()
+                    segments = get_or_create_recognition_stage(
+                        pipeline_run,
+                        input_video_path,
+                        video_duration,
+                        separation_result.dialogue_path,
+                    )
+
+            asr_audio_path = separation_result.dialogue_path
+            background_audio_path = separation_result.background_path
+
+            # ===== 在文本识别后启动说话人分离；输入依赖 dialogue.wav =====
+            if SPEAKER_AWARE_AVAILABLE:
+                _hf_token = os.environ.get('HF_TOKEN', '')
+                speaker_stage_path = pipeline_run.stage_dir("speaker_gender") / "speaker_gender.json"
+                speaker_stage_ready = is_stage_complete(
+                    pipeline_run,
+                    "speaker_gender",
+                    [speaker_stage_path],
+                )
+                if _hf_token and not speaker_stage_ready:
+                    run_diarization_async(asr_audio_path, _hf_token)
+            # =========================================================
             
             original_segments_data = []
-            filtered_intervals = []   # 被过滤片段的时间区间（不能当停顿借用）
             for segment in segments:
-                if segment.start >= video_duration:
+                if segment["start"] >= video_duration:
                     continue
-                actual_end = min(segment.end, video_duration)
-                duration = actual_end - segment.start
+                actual_end = min(segment["end"], video_duration)
+                duration = actual_end - segment["start"]
                 # 过滤短片段
                 if duration < 0.3:
-                    filtered_intervals.append((segment.start, actual_end))
                     continue
 
                 # 过滤语气词片段
-                text = segment.text.strip()
+                text = segment["text"].strip()
                 if is_filler_word(text):
-                    print(f"  - 过滤语气词: [{segment.start:.1f}s] '{text}'")
-                    filtered_intervals.append((segment.start, actual_end))
+                    print(f"  - 过滤语气词: [{segment['start']:.1f}s] '{text}'")
                     continue
 
                 original_segments_data.append({
                     "text": text,
-                    "start": segment.start,
+                    "start": segment["start"],
                     "end": actual_end,
                     "original_duration": duration
                 })
             print(f"  - 识别到 {len(original_segments_data)} 个有效语音片段")
             
             if not original_segments_data:
-                print("错误: 未识别到任何有效语音。请检查视频或尝试更大的Whisper模型。")
+                print("错误: 未识别到任何有效语音。请检查人声分离结果、OCR 环境或 faster-whisper 模型。")
                 return False
                 
         except Exception as e:
             print(f"  - 语音识别失败: {e}")
             return False
         
-        # 释放 ASR 模型内存
-        del model
         gc.collect()
 
         # ===== Step 2: 取说话人分离结果（ASR期间已后台运行）=====
@@ -1156,7 +1163,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             print('\n[2/6] 获取说话人分离结果...')
             _hf_token = os.environ.get('HF_TOKEN', '')
             if _hf_token:
-                speaker_map = wait_diarization()
+                speaker_map = get_or_create_speaker_gender_stage(pipeline_run, wait_diarization)
                 if not speaker_map:
                     print('  [说话人识别] 后台结果为空，使用单一声音')
             else:
@@ -1167,33 +1174,20 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         print(f"\n[3/6] 翻译为 {target_language}...")
         translated_segments_data = []
 
-        if parallel and len(original_segments_data) > 1:
-            # 并行翻译
-            translated_results = translate_segments_parallel(
-                original_segments_data, target_language, max_workers=workers
-            )
-
-            for result in translated_results:
-                translated_segments_data.append({
-                    "original_text": result["text"],
-                    "translated_text": result["translated"],
-                    "original_duration": result["duration"],
-                    "start": result["start"],
-                    "end": result["end"]
-                })
-        else:
-            # 顺序翻译（并行禁用或只有一个片段）
-            for i, seg in enumerate(original_segments_data):
-                translated_text = translate_text(seg["text"], target_language)
-                translated_segments_data.append({
-                    "original_text": seg["text"],
-                    "translated_text": translated_text,
-                    "original_duration": seg["original_duration"],
-                    "start": seg["start"],
-                    "end": seg["end"]
-                })
-                if i < 5:
-                    print(f"  [{i}] {seg['text'][:40]}... -> {translated_text[:40]}...")
+        translated_results = get_or_create_translation_stage(
+            pipeline_run,
+            original_segments_data,
+            target_language,
+            max_workers=workers if parallel else 1,
+        )
+        for result in translated_results:
+            translated_segments_data.append({
+                "original_text": result["text"],
+                "translated_text": result["translated"],
+                "original_duration": result["duration"],
+                "start": result["start"],
+                "end": result["end"]
+            })
 
         # ===== 分配说话人声音 =====
         if SPEAKER_AWARE_AVAILABLE and speaker_map:
@@ -1202,75 +1196,6 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 speaker_map, target_language, available_voices, selected_voice_key
             )
         # ==========================
-
-        # _timing_patch_applied
-        # ===== 时间对齐：一遍清晰版 =====
-        # 每段借用"本段后面的停顿"来容纳更长的TTS
-        # adjusted_start 往前移动借用量，确保音频不溢出到下一段
-        if translated_segments_data:
-            import re
-
-            def _est_tts(text):
-                """按字符数估算TTS时长"""
-                t = text.strip()
-                zh = len(re.findall(r'[\u4e00-\u9fff]', t))
-                en = len(re.findall(r'[a-zA-Z]+', t))
-                oth = max(0, len(t) - zh - en * 4)
-                return max(zh * 0.38 + en * 0.42 + oth * 0.1, 0.3)
-
-            n = len(translated_segments_data)
-            borrowed_count = 0
-            prev_audio_end = 0.0  # 上一段音频的实际结束时间
-
-            for i, seg in enumerate(translated_segments_data):
-                orig_dur   = seg["original_duration"]
-                orig_start = seg["start"]
-                orig_end   = seg["end"]
-                tts_est    = _est_tts(seg["translated_text"])
-
-                # 本段后面到下一段的停顿（扣除被过滤片段占用的时间）
-                if i + 1 < n:
-                    next_start = translated_segments_data[i + 1]["start"]
-                else:
-                    next_start = video_duration
-                raw_gap = max(0.0, next_start - orig_end)
-                # 被过滤片段的时间不能当停顿借用（那里有原始声音）
-                blocked = sum(
-                    min(fe, next_start) - max(fs, orig_end)
-                    for fs, fe in filtered_intervals
-                    if fs < next_start and fe > orig_end
-                )
-                gap_after = max(0.0, raw_gap - max(0.0, blocked))
-
-                # 可借用量：不超过溢出量，不超过90%停顿
-                overflow   = max(0.0, tts_est - orig_dur)
-                can_borrow = min(overflow, gap_after * 0.9)
-                avail      = orig_dur + can_borrow
-
-                # adjusted_start：借了多少就往前移多少
-                # 但不能早于上一段音频的结束时间（防止同声音重叠）
-                if can_borrow > 0.05:
-                    adjusted_start = max(prev_audio_end, orig_start - can_borrow)
-                    borrowed_count += 1
-                else:
-                    adjusted_start = max(prev_audio_end, orig_start)
-
-                # 双重保险：确保音频结束时间不超过下一段开始
-                audio_end = adjusted_start + avail
-                if audio_end > next_start - 0.05:
-                    avail = max(orig_dur, next_start - 0.05 - adjusted_start)
-
-                # 硬限制：不超出视频结尾
-                avail = min(avail, max(orig_dur, video_duration - adjusted_start - 0.05))
-
-                seg["available_duration"] = avail
-                seg["adjusted_start"]     = adjusted_start
-
-                # 记录本段音频结束时间，供下一段使用
-                prev_audio_end = adjusted_start + avail
-
-            print(f"  - 时间对齐: 借停顿={borrowed_count}段")
-        # =============================================
 
         # Step 4: 加载TTS模型
         print("\n[4/6] 加载TTS模型...")
@@ -1288,6 +1213,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
 
         # 5.1 并行生成所有 TTS 音频
         # 说话人感知：为每个片段标记对应的 voice_key
+        tts_cache_dir = pipeline_run.stage_dir("tts") / "clips"
         if SPEAKER_AWARE_AVAILABLE and speaker_map and speaker_voice_map:
             for seg in translated_segments_data:
                 seg['_voice_key'] = get_voice_for_segment(
@@ -1300,24 +1226,47 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             tts_results, tts_temp_files = _generate_tts_multi_voice(
                 translated_segments_data, target_language,
                 available_voices, selected_voice_key,
-                False, max_workers=tts_workers
+                False, max_workers=tts_workers,
+                cache_root=tts_cache_dir,
             )
         else:
             tts_results, tts_temp_files = generate_tts_parallel(
                 translated_segments_data, tts_model, tts_speaker_idx, target_language,
-                max_workers=tts_workers
+                max_workers=tts_workers,
+                cache_dir=tts_cache_dir,
             )
 
+        successful_tts_results = [
+            result for result in tts_results
+            if result and result.get("success") and result.get("temp_tts_file")
+        ]
+        if not successful_tts_results:
+            print("  - TTS 未生成任何有效音频片段")
+            return False
+
+        raw_tts_durations = []
+        ordered_segments = []
+        for tts_result in successful_tts_results:
+            raw_duration = _probe_audio_duration(tts_result["temp_tts_file"])
+            raw_tts_durations.append(raw_duration)
+            ordered_segments.append(tts_result["seg_data"])
+
+        planned_timeline = build_tts_timeline(
+            ordered_segments,
+            raw_tts_durations,
+            video_duration,
+            max_speed_factor=max_speed_factor,
+        )
+        print(f"  - 时间调度完成: {len(planned_timeline)} 段")
+
+        adjusted_durations = []
+
         # 5.2 顺序处理音频速度调整和片段创建
-
-        for i, tts_result in enumerate(tts_results):
-            if not tts_result or not tts_result.get("success"):
-                continue
-
+        for order_idx, (tts_result, timeline_entry) in enumerate(zip(successful_tts_results, planned_timeline)):
             seg_data = tts_result["seg_data"]
             temp_tts_file = tts_result["temp_tts_file"]
 
-            print(f"\n--- 处理片段 {i+1}/{len(tts_results)} ---")
+            print(f"\n--- 处理片段 {order_idx+1}/{len(successful_tts_results)} ---")
             print(f"    原时间: [{seg_data['start']:.2f}s -> {seg_data['end']:.2f}s], 时长: {seg_data['original_duration']:.2f}s")
 
             # 调整音频速度
@@ -1325,63 +1274,31 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             temp_adjusted_file = tmp_adj.name
             tmp_adj.close()
             temp_files_to_cleanup.append(temp_adjusted_file)
+            adjusted_tts_files.append(temp_adjusted_file)
 
             try:
-                # adjusted_start 和 available_duration 在时间对齐阶段已算好，直接用
-                _avail   = seg_data.get('available_duration', seg_data['original_duration'])
-                _start_t = seg_data.get('adjusted_start', seg_data['start'])
-                _eaten   = max(0.0, _avail - seg_data['original_duration'])
-
                 final_duration, speed_factor = adjust_audio_speed_ffmpeg(
                     temp_tts_file,
                     temp_adjusted_file,
-                    _avail,
+                    timeline_entry["target_duration"],
                     max_speed_factor=max_speed_factor,
                     min_speed_factor=min_speed_factor
                 )
-                seg_data['_adjusted_start'] = _start_t
-                print(f"    调整后时长: {final_duration:.2f}s, 速度: {speed_factor:.2f}x"
-                      + (f", 借停顿: {_eaten:.2f}s start={_start_t:.2f}s" if _eaten > 0.05 else ""))
+                adjusted_durations.append(_probe_audio_duration(temp_adjusted_file))
+                print(
+                    f"    调整后时长: {final_duration:.2f}s, 速度: {speed_factor:.2f}x, "
+                    f"目标窗口: {timeline_entry['target_duration']:.2f}s"
+                )
             except Exception as e:
                 print(f"    - 音频速度调整失败: {e}")
+                adjusted_durations.append(max(0.0, timeline_entry["target_duration"]))
                 continue
-
-            # 创建音频片段
-            try:
-                _start = seg_data.get('_adjusted_start', seg_data['start'])
-                _raw_clip = AudioFileClip(temp_adjusted_file)
-                # subclip 到 avail 时长，防止 ffmpeg 输出误差导致实际文件比计划长
-                _clip_dur = seg_data.get('available_duration', _raw_clip.duration)
-                if _raw_clip.duration > _clip_dur + 0.05:
-                    _raw_clip = _raw_clip.subclip(0, _clip_dur)
-                adjusted_clip = _raw_clip.set_start(_start)
-                final_audio_clips_for_composition.append(adjusted_clip)
-            except Exception as e:
-                print(f"    - 创建音频片段失败: {e}")
-                continue
-
-            # 创建字幕片段
-            if final_duration > 0.1:
-                try:
-                    _start = seg_data.get('_adjusted_start', seg_data['start'])
-                    subtitle_clip = create_subtitle_clip(
-                        seg_data["translated_text"],
-                        _start,
-                        min(final_duration, seg_data['original_duration'] * 1.5),
-                        video_width,
-                        video_height,
-                        target_language
-                    )
-                    subtitle_clips.append(subtitle_clip)
-                except Exception as e:
-                    print(f"    - 创建字幕片段失败: {e}")
 
             # 清理当前片段的临时 TTS 文件
-            if temp_tts_file and os.path.exists(temp_tts_file):
+            if temp_tts_file and os.path.exists(temp_tts_file) and not tts_result.get("cached"):
                 try:
-                    _safe_remove(temp_tts_file)
-                    if temp_tts_file in tts_temp_files:
-                        tts_temp_files.remove(temp_tts_file)
+                    if not str(temp_tts_file).startswith(str(tts_cache_dir)):
+                        _safe_remove(temp_tts_file)
                 except:
                     pass
 
@@ -1389,11 +1306,61 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         for temp_file in tts_temp_files:
             if temp_file and os.path.exists(temp_file):
                 try:
-                    os.remove(temp_file)
+                    if not str(temp_file).startswith(str(tts_cache_dir)):
+                        os.remove(temp_file)
                 except:
                     pass
+
+        final_timeline = finalize_tts_timeline(
+            planned_timeline,
+            adjusted_durations,
+            video_duration,
+        )
+        final_output_duration = max(video_duration, final_timeline[-1]["planned_end"])
+
+        for tts_result, timeline_entry, adjusted_file in zip(
+            successful_tts_results,
+            final_timeline,
+            adjusted_tts_files,
+        ):
+            try:
+                raw_clip = AudioFileClip(adjusted_file)
+                if raw_clip.duration > timeline_entry["target_duration"] + 0.05:
+                    raw_clip = raw_clip.subclip(0, timeline_entry["target_duration"])
+                adjusted_clip = raw_clip.set_start(timeline_entry["planned_start"])
+                final_audio_clips_for_composition.append(adjusted_clip)
+            except Exception as e:
+                print(f"    - 创建音频片段失败: {e}")
+                continue
+
+            if timeline_entry["target_duration"] > 0.1:
+                try:
+                    subtitle_clip = create_subtitle_clip(
+                        tts_result["seg_data"]["translated_text"],
+                        timeline_entry["planned_start"],
+                        timeline_entry["target_duration"],
+                        video_width,
+                        video_height,
+                        target_language
+                    )
+                    subtitle_clips.append(subtitle_clip)
+                except Exception as e:
+                    print(f"    - 创建字幕片段失败: {e}")
         
         # 释放 TTS 模型内存
+        mark_tts_stage_complete(
+            pipeline_run,
+            [
+                {
+                    "idx": result.get("idx"),
+                    "path": result.get("temp_tts_file"),
+                    "success": result.get("success"),
+                }
+                for result in tts_results
+                if result
+            ],
+            timeline=final_timeline,
+        )
         del tts_model
         gc.collect()
         
@@ -1402,35 +1369,36 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         print("  - 合成音频轨道 (使用绝对时间对齐)...")
         
         try:
-            # 6.1 使用静音背景轨，默认替换原视频音轨，避免原人声与新配音重叠
-            def create_silent_audio(duration, fps=44100):
-                n_frames = int(duration * fps)
-                silent_array = np.zeros((n_frames, 2), dtype=np.float32)
-                silent_audio = AudioArrayClip(silent_array, fps=fps)
-                silent_audio.duration = duration
-                silent_audio.end = silent_audio.start + duration
-                return silent_audio
-
-            silent_audio = create_silent_audio(video_duration)
-            print("  - 使用静音背景并替换原视频音轨")
+            composition_stage_dir = pipeline_run.stage_dir("composition")
+            frozen_frame_path = str(composition_stage_dir / "frozen_tail.png")
+            # 6.1 使用分离后的背景轨，保留 BGM/环境声但不保留原对白
+            background_audio = AudioFileClip(background_audio_path).set_start(0)
+            background_audio = CompositeAudioClip([background_audio]).set_duration(final_output_duration)
+            print("  - 使用分离后的背景轨并替换原视频对白")
             
-            # 6.2 组合音频（设置总时长=视频时长，防止音频溢出导致黑屏）
-            all_audio_clips = [silent_audio] + final_audio_clips_for_composition
+            # 6.2 组合音频（总时长跟随最终排程；尾部不足部分保持静音）
+            all_audio_clips = [background_audio] + final_audio_clips_for_composition
             final_audio_track = CompositeAudioClip(all_audio_clips)
-            final_audio_track = final_audio_track.set_duration(video_duration)
+            final_audio_track = final_audio_track.set_duration(final_output_duration)
 
             # 6.3 应用音频到视频
-            video_with_new_audio = original_video.set_audio(final_audio_track)
+            base_video = _extend_video_with_frozen_tail(
+                original_video,
+                input_video_path,
+                final_output_duration,
+                frozen_frame_path,
+            )
+            video_with_new_audio = base_video.set_audio(final_audio_track)
             
             # 6.4 添加字幕
             print(f"  - 添加 {len(subtitle_clips)} 个字幕片段...")
             if subtitle_clips:
                 final_video_with_subtitles = CompositeVideoClip(
                     [video_with_new_audio] + subtitle_clips,
-                    size=original_video.size
-                )
+                    size=original_video.size,
+                ).set_duration(final_output_duration)
             else:
-                final_video_with_subtitles = video_with_new_audio
+                final_video_with_subtitles = video_with_new_audio.set_duration(final_output_duration)
             
             # 6.5 输出视频 - 修复参数避免卡死
             print(f"  - 正在输出视频到: {output_video_path}")
@@ -1454,6 +1422,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 file_size = os.path.getsize(output_video_path)
                 if file_size > 10240:  # 大于10KB
                     print(f"  - ✓ 文件写入成功: {file_size/1024/1024:.1f} MB")
+                    mark_composition_stage_complete(pipeline_run, output_video_path)
                     return True
                 else:
                     print(f"  - ✗ 输出文件过小: {file_size} bytes")
@@ -1497,12 +1466,21 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 pass
         
         # 关闭 MoviePy 对象
-        for obj in [final_video_with_subtitles, video_with_new_audio, final_audio_track, original_video]:
+        for obj in [final_video_with_subtitles, video_with_new_audio, base_video, final_audio_track, original_video]:
             if obj:
                 try:
+                    temp_path = getattr(obj, "temp_path", None)
                     obj.close()
+                    if temp_path and os.path.exists(temp_path):
+                        _safe_remove(temp_path)
                 except:
                     pass
+
+        if separation_result:
+            try:
+                separation_result.cleanup()
+            except:
+                pass
         
         # 强制垃圾回收
         gc.collect()
@@ -1834,7 +1812,7 @@ def batch_process_videos(input_dir, output_dir, target_language, selected_voice_
 #仅合并:python video_dubbing.py --mode merge_only --output_dir ./output --merged_filename final_movie.mp4
 def _generate_tts_multi_voice(
     segments_data, target_lang, available_voices,
-    fallback_voice_key, gpu_available, max_workers=3
+    fallback_voice_key, gpu_available, max_workers=3, cache_root=None
 ):
     """
     按说话人分组，为每组加载对应 TTS 模型并生成音频。
@@ -1872,9 +1850,11 @@ def _generate_tts_multi_voice(
 
         # 只取该组的 seg_data 列表
         group_segs = [seg for _, seg in group]
+        group_cache_dir = Path(cache_root) / voice_key if cache_root else None
         group_results, group_temps = generate_tts_parallel(
             group_segs, tts_model, tts_speaker_idx, target_lang,
-            max_workers=max_workers
+            max_workers=max_workers,
+            cache_dir=group_cache_dir,
         )
         all_temp_files.extend(group_temps)
 
@@ -1907,8 +1887,8 @@ def main():
     parser.add_argument("--target_lang", help="目标语言代码 (单文件和多文件处理模式),例如：en, ja, ko, fr, pt, es, id, vi, tr, hi, ar, th, de, it")
     parser.add_argument("--voice", default="en_vctk_vits_m001", choices=available_voices.keys(),
                         help="选择配音声音")
-    parser.add_argument("--max_speed", type=float, default=1.5,
-                        help="最大语速加速倍数 (默认: 1.5，超过此值听感明显失真)")
+    parser.add_argument("--max_speed", type=float, default=1.35,
+                        help="最大语速加速倍数 (默认: 1.35，超过此值听感明显失真)")
     parser.add_argument("--min_speed", type=float, default=1.0,
                         help="最小语速倍数 (默认: 1.0，TTS短于原始时长时原速播放不拉伸)")
     parser.add_argument("--merged_filename", default="merged_output.mp4",

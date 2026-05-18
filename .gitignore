@@ -9,6 +9,12 @@
 input/
 output/
 tmp/
+trans_env/
+separation_env/
+ocr_env/
+asr_env/
+.claude/
+pretrained_models/
 __pycache__/
 *.pyc
 .idea/

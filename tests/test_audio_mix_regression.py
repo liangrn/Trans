@@ -1,12 +1,15 @@
 from pathlib import Path
 
 
-def test_dubbing_mix_replaces_original_audio_track_by_default():
+def test_dubbing_uses_separated_background_and_never_original_audio():
     source = Path(__file__).resolve().parents[1] / "video_dubbing.py"
     text = source.read_text(encoding="utf-8")
 
-    assert "silent_audio = create_silent_audio(video_duration)" in text
-    assert "all_audio_clips = [silent_audio] + final_audio_clips_for_composition" in text
+    assert "get_or_create_audio_stage" in text
+    assert "asr_audio_path = separation_result.dialogue_path" in text
+    assert "background_audio_path = separation_result.background_path" in text
+    assert "background_audio = AudioFileClip(background_audio_path)" in text
+    assert "all_audio_clips = [background_audio] + final_audio_clips_for_composition" in text
     assert "background_audio_clips" not in text
     assert "original_video.audio.set_duration(video_duration)" not in text
     assert "background_volume" not in text
@@ -33,7 +36,9 @@ def test_runtime_and_windows_install_are_cpu_only():
     ]
 
     combined = "\n".join(
-        (root / path).read_text(encoding="utf-8") for path in checked_files
+        (root / path).read_text(encoding="utf-8")
+        for path in checked_files
+        if (root / path).exists()
     )
 
     forbidden = [
@@ -67,3 +72,147 @@ def test_windows_install_script_has_preflight_logging_and_post_checks():
     assert "call :run_pip_install" in text
     assert "HF_TOKEN is not set" in text
     assert "python video_dubbing.py --help" in text
+
+
+def test_vocal_separation_is_required_without_cli_switches():
+    root = Path(__file__).resolve().parents[1]
+    dubbing = (root / "video_dubbing.py").read_text(encoding="utf-8")
+    subtitles = (root / "video_subtitles_only.py").read_text(encoding="utf-8")
+    helper = (root / "audio_separation.py").read_text(encoding="utf-8")
+    installer = (root / "install_windows.bat").read_text(encoding="utf-8")
+
+    forbidden_cli = [
+        "--vocal_separation",
+        "--keep_background_audio",
+        "--background_volume",
+    ]
+    combined = dubbing + subtitles
+    for token in forbidden_cli:
+        assert token not in combined
+
+    assert "get_or_create_audio_stage," in dubbing
+    assert "get_or_create_audio_stage" in subtitles
+    assert "dialogue_path" in helper
+    assert "compand=" in helper
+    assert "afftdn=" in helper
+    assert "asr_audio_path = separation_result.dialogue_path" in dubbing
+    assert "separation_result.dialogue_path" in subtitles
+    assert "get_or_create_recognition_stage(" in dubbing
+    assert "get_or_create_recognition_stage(" in subtitles
+    assert "final_clip = final_clip.set_audio(original_video.audio)" in subtitles
+    assert "audio-separator" in helper
+    assert "separation_env" in installer
+    assert "audio-separator[cpu]" in installer
+    assert "source.wav" not in " ".join(
+        line.strip() for line in helper.splitlines() if "print(" in line
+    )
+
+
+def test_dubbing_uses_faster_whisper_fallback_and_builds_background_from_asr_mask():
+    root = Path(__file__).resolve().parents[1]
+    dubbing = (root / "video_dubbing.py").read_text(encoding="utf-8")
+    subtitles = (root / "video_subtitles_only.py").read_text(encoding="utf-8")
+    helper = (root / "audio_separation.py").read_text(encoding="utf-8")
+    asr = (root / "asr_recognition.py").read_text(encoding="utf-8")
+    installer = (root / "install_windows.bat").read_text(encoding="utf-8")
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+
+    assert "get_or_create_recognition_stage" in dubbing
+    assert "get_or_create_recognition_stage" in subtitles
+    assert "background_audio_path = separation_result.background_path" in dubbing
+    assert "def build_background_with_non_speech_vocals(" in helper
+    assert "speech_segments" in helper
+    assert "WhisperModel" in asr
+    assert 'DEFAULT_WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "medium")' in asr
+    assert 'device="cpu"' in asr
+    assert 'compute_type="int8"' in asr
+    assert "faster-whisper" in requirements
+    assert "Install faster-whisper" in installer
+    assert "funasr" not in installer.lower()
+    assert "asr_env" not in installer
+
+
+def test_ocr_is_primary_text_source_and_asr_is_fallback_only():
+    root = Path(__file__).resolve().parents[1]
+    dubbing = (root / "video_dubbing.py").read_text(encoding="utf-8")
+    subtitles = (root / "video_subtitles_only.py").read_text(encoding="utf-8")
+    stages = (root / "pipeline_stages.py").read_text(encoding="utf-8")
+    ocr = (root / "ocr_recognition.py").read_text(encoding="utf-8")
+
+    assert "get_or_create_recognition_stage(" in dubbing
+    assert "get_or_create_recognition_stage(" in subtitles
+    assert "from ocr_recognition import get_ocr_subtitle_segments" in stages
+    assert "get_ocr_subtitle_segments(" in stages
+    assert "transcribe_chinese_audio(asr_audio_path)" in stages
+    assert "ocr_env" in ocr
+    assert "ocr_subtitle_probe.py" in ocr
+
+
+def test_pipeline_uses_output_filename_stage_directory_and_translation_cache():
+    root = Path(__file__).resolve().parents[1]
+    dubbing = (root / "video_dubbing.py").read_text(encoding="utf-8")
+    subtitles = (root / "video_subtitles_only.py").read_text(encoding="utf-8")
+    cache = (root / "pipeline_cache.py").read_text(encoding="utf-8")
+    stages = (root / "pipeline_stages.py").read_text(encoding="utf-8")
+    translation = (root / "translation_cache.py").read_text(encoding="utf-8")
+
+    assert "get_pipeline_run(" in dubbing
+    assert "get_pipeline_run(" in subtitles
+    assert "ThreadPoolExecutor(max_workers=2)" in dubbing
+    assert "ThreadPoolExecutor(max_workers=2)" in subtitles
+    assert "output_path.stem" in cache
+    assert "run_manifest.json" in cache
+    assert "stage.done.json" in cache
+    assert "01_audio" in cache
+    assert "02_recognition" in cache
+    assert "04_translation" in cache
+    assert "translation_pending.json" in translation
+    assert "translation_report.json" in translation
+    assert "translate_segments_with_cache(" in stages
+    assert "recognized_segments.json" in stages
+    assert "recognized_text.txt" in stages
+
+
+def test_dubbing_uses_real_tts_timeline_and_freezes_tail_for_overflow():
+    root = Path(__file__).resolve().parents[1]
+    dubbing = (root / "video_dubbing.py").read_text(encoding="utf-8")
+    stages = (root / "pipeline_stages.py").read_text(encoding="utf-8")
+    timeline = (root / "tts_timeline.py").read_text(encoding="utf-8")
+
+    assert "build_tts_timeline(" in dubbing
+    assert "finalize_tts_timeline(" in dubbing
+    assert "tts_timeline.json" in stages
+    assert "freeze_tail" in timeline
+    assert '"-frames:v", "1"' in dubbing
+    assert 'pipeline_run.stage_dir("composition")' in dubbing
+    assert 'frozen_frame_path = str(composition_stage_dir / "frozen_tail.png")' in dubbing
+    assert '"-sseof", "-1"' in dubbing
+    assert '"-update", "1"' in dubbing
+    assert 'Image.open(frozen_frame_path).convert("RGB")' in dubbing
+    assert '冻结帧文件未生成' in dubbing
+    assert 'ImageClip(frozen_frame)' in dubbing
+    assert "frozen_tail.temp_path = frozen_frame_path" in dubbing
+    assert "final_output_duration = max(video_duration, final_timeline[-1][\"planned_end\"])" in dubbing
+    assert "set_duration(final_output_duration)" in dubbing
+    assert "_est_tts" not in dubbing
+    assert "available_duration" not in dubbing
+    assert "adjusted_start" not in dubbing
+    assert "original_duration'] * 1.5" not in dubbing
+
+
+def test_cached_speaker_stage_does_not_restart_background_diarization():
+    root = Path(__file__).resolve().parents[1]
+    dubbing = (root / "video_dubbing.py").read_text(encoding="utf-8")
+
+    assert 'speaker_stage_path = pipeline_run.stage_dir("speaker_gender") / "speaker_gender.json"' in dubbing
+    assert 'speaker_stage_ready = is_stage_complete(' in dubbing
+    assert 'if _hf_token and not speaker_stage_ready:' in dubbing
+
+
+def test_old_inline_translation_path_removed_from_dubbing():
+    root = Path(__file__).resolve().parents[1]
+    dubbing = (root / "video_dubbing.py").read_text(encoding="utf-8")
+
+    assert "def translate_text(" not in dubbing
+    assert "def translate_segments_parallel(" not in dubbing
+    assert "GoogleTranslator(" not in dubbing

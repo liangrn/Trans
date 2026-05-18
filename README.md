@@ -1,6 +1,6 @@
 # 视频翻译配音工具
 
-中文视频自动翻译配音与字幕生成工具。支持语音识别 → 翻译 → TTS 配音，可选说话人分离与性别识别。
+中文视频自动翻译配音与字幕生成工具。支持硬字幕 OCR / 语音识别 → 翻译 → TTS 配音，并支持说话人分离与性别识别。
 
 ---
 
@@ -24,8 +24,8 @@
 
 | 脚本 | 用途 |
 |------|------|
-| `video_dubbing.py` | 完整配音：语音识别 → 翻译 → TTS 合成 → 字幕叠加 → 输出 |
-| `video_subtitles_only.py` | 仅字幕：语音识别 → 翻译 → 字幕叠加（不替换原声） |
+| `video_dubbing.py` | 完整配音：OCR/语音识别 → 翻译 → TTS 合成 → 字幕叠加 → 输出 |
+| `video_subtitles_only.py` | 仅字幕：OCR/语音识别 → 翻译 → 字幕叠加（不替换原声） |
 
 两个脚本均支持单文件、批量处理、批量处理后合并三种模式。
 
@@ -50,9 +50,11 @@
 脚本会自动完成：
 1. 检测 Python 版本
 2. 检查部署包是否完整（包括 `voice-gender-classifier/model.py`）
-3. 创建独立虚拟环境并选择 CPU-only torch wheel
+3. 创建主虚拟环境 `trans_env` 并选择 CPU-only torch wheel
 4. 按正确顺序安装所有依赖（numpy 版本锁定、torch 专用源）
-5. 验证每个关键包是否能正常导入，并检查 `video_dubbing.py --help`
+5. 创建独立人声分离环境 `separation_env`，安装 `audio-separator[cpu]`
+6. 创建独立硬字幕 OCR 环境 `ocr_env`，安装 `PaddleOCR`
+7. 验证每个关键包是否能正常导入，并检查 `video_dubbing.py --help`
 
 脚本会在项目根目录生成 `install_windows.log`。安装失败时先看这个日志，不要只看命令行最后一行。
 
@@ -75,6 +77,19 @@ pip install torch>=2.3.0,<2.4.0 torchaudio>=2.3.0,<2.4.0 ^
 
 # 4. 安装其余依赖
 pip install -r requirements.txt
+
+# 5. 创建独立人声分离环境（不要装进主环境）
+python -m venv separation_env
+separation_env\Scripts\python -m pip install --upgrade pip setuptools wheel
+separation_env\Scripts\python -m pip install imageio-ffmpeg
+separation_env\Scripts\python -m pip install "audio-separator[cpu]"
+
+# 6. 创建独立硬字幕 OCR 环境（不要装进主环境）
+python -m venv ocr_env
+ocr_env\Scripts\python -m pip install --upgrade pip setuptools wheel
+ocr_env\Scripts\python -m pip install paddleocr paddlepaddle opencv-python-headless
+
+# 7. ASR 兜底使用主环境中的 faster-whisper，无需创建独立 ASR 环境
 ```
 
 ---
@@ -87,10 +102,13 @@ pip install -r requirements.txt
 
 1. 当前版本固定为 CPU-only 运行，不再提供 GPU/CUDA 安装路径。
 2. 部署目录必须完整包含 `voice-gender-classifier/` 子目录，至少要有 `voice-gender-classifier/model.py`。
-3. 如果缺少 `voice-gender-classifier/model.py`，程序会记录
+3. 所有视频处理都会先做人声分离；部署目录必须有可用的 `separation_env` 或 PATH 中可用的 `audio-separator`。
+4. 中文文本识别优先使用硬字幕 OCR；只要 OCR 结果可用，就会跳过 ASR。部署目录必须有可用的 `ocr_env`，或用环境变量 `OCR_PYTHON` 指定 Python。
+5. 无可用硬字幕时，才使用主环境里的 `faster-whisper` 兜底识别，默认模型为 `medium`，可用环境变量 `WHISPER_MODEL_SIZE` 调整。
+6. 如果缺少 `voice-gender-classifier/model.py`，程序会记录
    `本地性别模型文件不存在: .../voice-gender-classifier/model.py`，随后退回 embedding 统计，男女声识别准确率会明显下降。
-4. Windows 推荐直接运行 `install_windows.bat`；macOS 推荐在独立 conda/venv 环境内手动安装。
-5. 在线说话人分离依赖 HuggingFace token；未设置 `HF_TOKEN` 时会跳过说话人分离，整段视频使用同一个声音。
+7. Windows 推荐直接运行 `install_windows.bat`。
+8. 在线说话人分离依赖 HuggingFace token；未设置 `HF_TOKEN` 时会跳过说话人分离，整段视频使用同一个声音。
 
 ---
 
@@ -245,6 +263,12 @@ speaker_aware_dubbing.py
 gender_classifier.py
 requirements.txt
 install_windows.bat          # Windows 推荐保留
+audio_separation.py
+asr_recognition.py
+ocr_recognition.py
+ocr_subtitle_probe.py
+separation_env/              # 可重新创建；用于 audio-separator
+ocr_env/                     # 可重新创建；用于 PaddleOCR
 voice-gender-classifier/
   ├── model.py
   ├── README.md
