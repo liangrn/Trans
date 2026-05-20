@@ -63,6 +63,7 @@ def _model_cache_key(voice_config):
         voice_config.get("model_name", ""),
         voice_config.get("language", ""),
         voice_config.get("speaker_wav", ""),
+        voice_config.get("reference_voice_key", ""),
     )
 
 
@@ -126,7 +127,10 @@ def main():
             print(f"Key: {key}")
             print(f"description: {voice_config.get('description', '')}")
             print(f"model_name: {voice_config.get('model_name', '')}")
+            print(f"language: {voice_config.get('language', '')}")
             print(f"speaker_idx: {voice_config.get('speaker_idx', '')}")
+            print(f"reference_voice_key: {voice_config.get('reference_voice_key', '')}")
+            print(f"speaker_wav: {voice_config.get('speaker_wav', '')}")
             print("=" * 72)
 
             try:

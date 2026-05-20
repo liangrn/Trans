@@ -308,25 +308,11 @@ def _extend_video_with_frozen_tail(
 def get_available_coqui_voices():
     """获取可用的 Coqui TTS 声音/模型列表。
 
-    模型来源说明（问题7修复）：
-    ─────────────────────────────────────────────────────────────────────
-    原代码中大量非英语条目（如 tts_models/ko/css10/vits、
-    tts_models/vi/common-voice/vits 等）在 Coqui 官方仓库中根本不存在，
-    调用时会被静默降级为英语模型，用户毫无察觉。
-
-    修复方案：
-    1. 英语：保留真实存在的 tts_models/en/vctk/vits（100+ 说话人）
-             和 tts_models/en/ljspeech/vits（单说话人，质量高）
-    2. 德语：保留真实存在的 tts_models/de/thorsten/vits（Coqui 官方验证）
-    3. 多语言（韩/日/中/印尼/越南/西班牙/法/葡/土耳其/阿拉伯/印地/泰）：
-       统一使用 tts_models/multilingual/multi-dataset/xtts_v2
-       XTTS-v2 是 Coqui 官方发布的多语言模型，支持 17 种语言，
-       Windows 有预编译 wheel，无需单语种模型。
-       xtts_v2 需要 3~6 秒参考音频（speaker_wav），
-       如未提供则使用内置默认说话人。
-    ─────────────────────────────────────────────────────────────────────
+    英语使用 VCTK 原生多说话人模型。非英语的规则 key
+    (<lang>_male_001..005 / <lang>_female_001..005) 使用 XTTS-v2
+    跨语言克隆英文 VCTK 前 5 男声/女声，保证多说话人配音有稳定
+    的轮换音色。真实单语种 Coqui 模型保留为 native key，供手动选择。
     """
-    # XTTS-v2 model ID（多语言，Coqui 官方模型，真实存在）
     XTTS_V2 = "tts_models/multilingual/multi-dataset/xtts_v2"
 
     voices = {
@@ -361,78 +347,79 @@ def get_available_coqui_voices():
         # 英语单说话人高质量备选
         "en_ljspeech_vits":   {"model_name": "tts_models/en/ljspeech/vits",    "description": "VITS (LJSpeech, 女声, 标准美式)"},
 
-        # ==================== 德语 (German) — 真实存在的单语种模型 ====================
-        # tts_models/de/thorsten/vits 是 Coqui 官方验证的德语 VITS 模型
-        "de_male_001": {"model_name": "tts_models/de/thorsten/vits", "description": "VITS (德语, Thorsten, 男声, 标准)"},
-        "de_male_002": {"model_name": "tts_models/de/thorsten-emotion/tacotron2-DDC", "description": "Tacotron2 (德语, Thorsten-Emotion, 表情丰富)"},
-
-        # ==================== 多语言 — XTTS-v2（唯一真实存在且支持以下语言的 Coqui 模型）====================
-        # 支持语言：en/es/fr/de/it/pt/pl/tr/ru/nl/cs/ar/zh-cn/ja/ko/hu/hi
-        # speaker_wav 字段（可选）：提供 3~6 秒参考音频路径可克隆音色；留 None 使用内置默认音色。
-        # 注意：XTTS-v2 需要 language 参数，在 synthesize_speech_coqui_single 中已通过
-        #       target_lang 传入，此处 speaker_idx 字段用于区分配置，不传给模型。
-
-        # ── 韩语 (Korean) ──
-        "ko_male_001":   {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 男声1, 标准)"},
-        "ko_male_002":   {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 男声2, 沉稳)"},
-        "ko_female_001": {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 女声1, 甜美)"},
-        "ko_female_002": {"model_name": XTTS_V2, "language": "ko", "description": "XTTS-v2 (韩语, 女声2, 清晰)"},
-
-        # ── 日语 (Japanese) ──
-        "ja_male_001":   {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 男声1, 标准)"},
-        "ja_male_002":   {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 男声2, 沉稳)"},
-        "ja_female_001": {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 女声1, 甜美)"},
-        "ja_female_002": {"model_name": XTTS_V2, "language": "ja", "description": "XTTS-v2 (日语, 女声2, 温柔)"},
-
-        # ── 中文 (Chinese Simplified) ──
-        "zh_male_001":   {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 男声1, 标准)"},
-        "zh_male_002":   {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 男声2, 沉稳)"},
-        "zh_female_001": {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 女声1, 甜美)"},
-        "zh_female_002": {"model_name": XTTS_V2, "language": "zh-cn", "description": "XTTS-v2 (中文, 女声2, 清晰)"},
-
-        # ── 西班牙语 (Spanish) ──
-        "es_male_001":   {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 男声1, 标准)"},
-        "es_male_002":   {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 男声2, 热情)"},
-        "es_female_001": {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 女声1, 甜美)"},
-        "es_female_002": {"model_name": XTTS_V2, "language": "es", "description": "XTTS-v2 (西班牙语, 女声2, 清晰)"},
-
-        # ── 法语 (French) ──
-        "fr_male_001":   {"model_name": XTTS_V2, "language": "fr", "description": "XTTS-v2 (法语, 男声1, 标准)"},
-        "fr_female_001": {"model_name": XTTS_V2, "language": "fr", "description": "XTTS-v2 (法语, 女声1, 优雅)"},
-
-        # ── 葡萄牙语 (Portuguese) ──
-        "pt_male_001":   {"model_name": XTTS_V2, "language": "pt", "description": "XTTS-v2 (葡萄牙语, 男声1, 标准)"},
-        "pt_female_001": {"model_name": XTTS_V2, "language": "pt", "description": "XTTS-v2 (葡萄牙语, 女声1, 清晰)"},
-
-        # ── 意大利语 (Italian) ──
-        "it_male_001":   {"model_name": XTTS_V2, "language": "it", "description": "XTTS-v2 (意大利语, 男声1, 标准)"},
-        "it_female_001": {"model_name": XTTS_V2, "language": "it", "description": "XTTS-v2 (意大利语, 女声1, 优雅)"},
-
-        # ── 土耳其语 (Turkish) ──
-        "tr_male_001":   {"model_name": XTTS_V2, "language": "tr", "description": "XTTS-v2 (土耳其语, 男声1, 标准)"},
-        "tr_female_001": {"model_name": XTTS_V2, "language": "tr", "description": "XTTS-v2 (土耳其语, 女声1, 清晰)"},
-
-        # ── 阿拉伯语 (Arabic) ──
-        "ar_male_001":   {"model_name": XTTS_V2, "language": "ar", "description": "XTTS-v2 (阿拉伯语, 男声1, 标准)"},
-        "ar_female_001": {"model_name": XTTS_V2, "language": "ar", "description": "XTTS-v2 (阿拉伯语, 女声1, 清晰)"},
-
-        # ── 印地语 (Hindi) ──
-        "hi_male_001":   {"model_name": XTTS_V2, "language": "hi", "description": "XTTS-v2 (印地语, 男声1, 标准)"},
-        "hi_female_001": {"model_name": XTTS_V2, "language": "hi", "description": "XTTS-v2 (印地语, 女声1, 清晰)"},
-
-        # ── 俄语 (Russian) ──
-        "ru_male_001":   {"model_name": XTTS_V2, "language": "ru", "description": "XTTS-v2 (俄语, 男声1, 标准)"},
-        "ru_female_001": {"model_name": XTTS_V2, "language": "ru", "description": "XTTS-v2 (俄语, 女声1, 清晰)"},
-
-        # ── 荷兰语 (Dutch) ──
-        "nl_male_001":   {"model_name": XTTS_V2, "language": "nl", "description": "XTTS-v2 (荷兰语, 男声1, 标准)"},
-        "nl_female_001": {"model_name": XTTS_V2, "language": "nl", "description": "XTTS-v2 (荷兰语, 女声1, 清晰)"},
-
-        # ── 波兰语 (Polish) ──
-        "pl_male_001":   {"model_name": XTTS_V2, "language": "pl", "description": "XTTS-v2 (波兰语, 男声1, 标准)"},
-        "pl_female_001": {"model_name": XTTS_V2, "language": "pl", "description": "XTTS-v2 (波兰语, 女声1, 清晰)"},
+        # ==================== 真实存在的 Coqui 单语种模型（手动选择，不参与自动轮换） ====================
+        #"de_native_thorsten_vits": {"model_name": "tts_models/de/thorsten/vits", "description": "Native (德语, Thorsten, VITS)"},
+        #"de_native_thorsten_tacotron_ddc": {"model_name": "tts_models/de/thorsten/tacotron2-DDC", "description": "Native (德语, Thorsten, Tacotron2-DDC)"},
+        #"de_native_thorsten_tacotron_dca": {"model_name": "tts_models/de/thorsten/tacotron2-DCA", "description": "Native (德语, Thorsten, Tacotron2-DCA)"},
+        #"ja_native_kokoro": {"model_name": "tts_models/ja/kokoro/tacotron2-DDC", "description": "Native (日语, Kokoro, Tacotron2-DDC)"},
+        #"zh_native_baker": {"model_name": "tts_models/zh-CN/baker/tacotron2-DDC-GST", "description": "Native (中文, Baker, Tacotron2-DDC-GST)"},
+        #"es_native_mai": {"model_name": "tts_models/es/mai/tacotron2-DDC", "description": "Native (西班牙语, Mai, Tacotron2-DDC)"},
+        #"es_native_css10_vits": {"model_name": "tts_models/es/css10/vits", "description": "Native (西班牙语, CSS10, VITS)"},
+        #"fr_native_mai": {"model_name": "tts_models/fr/mai/tacotron2-DDC", "description": "Native (法语, Mai, Tacotron2-DDC)"},
+        #"fr_native_css10_vits": {"model_name": "tts_models/fr/css10/vits", "description": "Native (法语, CSS10, VITS)"},
+        #"it_native_mai_m_vits": {"model_name": "tts_models/it/mai_male/vits", "description": "Native (意大利语, Mai, 男声, VITS)"},
+        #"it_native_mai_m_glow_tts": {"model_name": "tts_models/it/mai_male/glow-tts", "description": "Native (意大利语, Mai, 男声, Glow-TTS)"},
+        #"it_native_mai_f_vits": {"model_name": "tts_models/it/mai_female/vits", "description": "Native (意大利语, Mai, 女声, VITS)"},
+        #"it_native_mai_f_glow_tts": {"model_name": "tts_models/it/mai_female/glow-tts", "description": "Native (意大利语, Mai, 女声, Glow-TTS)"},
+        #"nl_native_mai": {"model_name": "tts_models/nl/mai/tacotron2-DDC", "description": "Native (荷兰语, Mai, Tacotron2-DDC)"},
+        #"nl_native_css10_vits": {"model_name": "tts_models/nl/css10/vits", "description": "Native (荷兰语, CSS10, VITS)"},
+        #"pl_native_mai_f_vits": {"model_name": "tts_models/pl/mai_female/vits", "description": "Native (波兰语, Mai, 女声, VITS)"},
+        #"pt_native_cv_vits": {"model_name": "tts_models/pt/cv/vits", "description": "Native (葡萄牙语, Common Voice, VITS)"},
+        #"tr_native_common_voice_glow_tts": {"model_name": "tts_models/tr/common-voice/glow-tts", "description": "Native (土耳其语, Common Voice, Glow-TTS)"},
     }
+
+    _add_xtts_clone_voices(voices, XTTS_V2)
     return voices
+
+
+def _add_xtts_clone_voices(voices, xtts_model_name):
+    xtts_langs = {
+        "ja": {"language": "ja", "name": "日语"},
+        "ko": {"language": "ko", "name": "韩语"},
+        "zh": {"language": "zh-cn", "name": "中文"},
+        "es": {"language": "es", "name": "西班牙语"},
+        "fr": {"language": "fr", "name": "法语"},
+        "de": {"language": "de", "name": "德语"},
+        "it": {"language": "it", "name": "意大利语"},
+        "pt": {"language": "pt", "name": "葡萄牙语"},
+        "pl": {"language": "pl", "name": "波兰语"},
+        "tr": {"language": "tr", "name": "土耳其语"},
+        "ru": {"language": "ru", "name": "俄语"},
+        "nl": {"language": "nl", "name": "荷兰语"},
+        "ar": {"language": "ar", "name": "阿拉伯语"},
+        "hi": {"language": "hi", "name": "印地语"},
+    }
+    reference_voices = {
+        "male": [
+            "en_vctk_vits_m001",
+            "en_vctk_vits_m002",
+            "en_vctk_vits_m003",
+            "en_vctk_vits_m004",
+            "en_vctk_vits_m005",
+        ],
+        "female": [
+            "en_vctk_vits_f001",
+            "en_vctk_vits_f002",
+            "en_vctk_vits_f003",
+            "en_vctk_vits_f004",
+            "en_vctk_vits_f005",
+        ],
+    }
+
+    for lang_key, lang_info in xtts_langs.items():
+        for gender, ref_keys in reference_voices.items():
+            gender_label = "男声" if gender == "male" else "女声"
+            for index, reference_voice_key in enumerate(ref_keys, start=1):
+                voice_key = f"{lang_key}_{gender}_{index:03d}"
+                voices[voice_key] = {
+                    "model_name": xtts_model_name,
+                    "language": lang_info["language"],
+                    "reference_voice_key": reference_voice_key,
+                    "description": (
+                        f"XTTS-v2 ({lang_info['name']}, {gender_label}{index}, "
+                        f"克隆自 {reference_voice_key})"
+                    ),
+                }
 
 
 def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
@@ -600,6 +587,40 @@ def _is_valid_cached_tts_file(path):
         return False
 
 
+def _get_or_create_xtts_reference_wav(reference_voice_key):
+    """为 XTTS 跨语言克隆生成英文 VCTK 参考音频缓存。"""
+    voices = get_available_coqui_voices()
+    reference_config = voices.get(reference_voice_key)
+    if not reference_config:
+        raise ValueError(f"reference_voice_key 不存在: {reference_voice_key}")
+    if reference_config.get("model_name") == "tts_models/multilingual/multi-dataset/xtts_v2":
+        raise ValueError(f"reference_voice_key 不能指向 XTTS 克隆声音: {reference_voice_key}")
+
+    cache_dir = Path(__file__).resolve().parent / "pretrained_models" / "xtts_voice_refs"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output_path = cache_dir / f"{reference_voice_key}.wav"
+    if _is_valid_cached_tts_file(str(output_path)):
+        return str(output_path)
+
+    print(f"  - 生成 XTTS 参考音频: {reference_voice_key}")
+    ref_tts = None
+    try:
+        ref_tts, ref_speaker_idx = load_coqui_tts_model(reference_config, gpu_is_available=False)
+        synthesize_speech_coqui_single(
+            ref_tts,
+            ref_speaker_idx,
+            "This is a clear reference voice for multilingual dubbing.",
+            str(output_path),
+            target_lang="en",
+        )
+        if not _is_valid_cached_tts_file(str(output_path)):
+            raise RuntimeError(f"参考音频生成失败或无效: {output_path}")
+        return str(output_path)
+    finally:
+        if ref_tts is not None:
+            del ref_tts
+
+
 def load_coqui_tts_model(voice_config, gpu_is_available=False):
     """加载 Coqui TTS 模型。
 
@@ -614,17 +635,22 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
     speaker_idx = voice_config.get("speaker_idx", None)
     # XTTS-v2 需要额外的 language 参数，从配置中读取
     xtts_language = voice_config.get("language", None)
+    speaker_wav = voice_config.get("speaker_wav")
+    reference_voice_key = voice_config.get("reference_voice_key")
 
     print(f"  - 加载TTS模型: {model_name}")
     if xtts_language:
         print(f"    语言参数: {xtts_language}")
+    if reference_voice_key:
+        speaker_wav = _get_or_create_xtts_reference_wav(reference_voice_key)
+        print(f"    参考音色: {reference_voice_key}")
 
     try:
         tts = TTS(model_name=model_name, progress_bar=True, gpu=False)
         # 将 xtts_language 存入模型实例，供 synthesize_speech_coqui_single 使用
         tts._xtts_language = xtts_language
         tts._model_name = model_name
-        tts._speaker_wav = voice_config.get("speaker_wav")
+        tts._speaker_wav = speaker_wav
         return tts, speaker_idx
     except Exception as e:
         # 明确警告：不再静默，避免用户不知情地收到英语配音

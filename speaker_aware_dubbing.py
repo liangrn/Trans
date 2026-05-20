@@ -240,12 +240,18 @@ def get_voice_for_segment(
             "final_confidence",
             alignment.get("smoothed_confidence", alignment.get("segment_confidence", 0.0))
         )
+    speaker_default_voice = speaker_voice_map.get(best_speaker)
+    speaker_default_gender = _voice_key_gender(speaker_default_voice) if speaker_default_voice else "unknown"
     if (
         aligned_gender in ("male", "female")
         and aligned_confidence >= 0.85
         and available_voices
+        and speaker_default_gender != aligned_gender
     ):
         return _get_voice_by_gender(aligned_gender, target_lang, available_voices, fallback_voice_key)
+
+    if speaker_default_voice:
+        return speaker_default_voice
 
     speaker_gender = (
         speaker_map.get(best_speaker, {}).get("subtitle_gender")
@@ -254,7 +260,7 @@ def get_voice_for_segment(
     if speaker_gender in ("male", "female") and available_voices:
         return _get_voice_by_gender(speaker_gender, target_lang, available_voices, fallback_voice_key)
 
-    return speaker_voice_map.get(best_speaker, fallback_voice_key)
+    return fallback_voice_key
 
 
 def explain_segment_voice_alignment(

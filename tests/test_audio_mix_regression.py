@@ -200,6 +200,44 @@ def test_strong_male_subtitle_segment_can_override_female_speaker_vote():
     assert voice == "en_vctk_vits_m001"
 
 
+def test_segment_voice_keeps_speaker_specific_voice_for_same_gender():
+    from speaker_aware_dubbing import get_voice_for_segment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+        "en_vctk_vits_f002": {},
+    }
+    speaker_map = {
+        "SPEAKER_01": {
+            "gender": "female",
+            "subtitle_gender": "female",
+            "segments": [(20.0, 24.0)],
+            "subtitle_alignments": [
+                {
+                    "start": 21.0,
+                    "end": 22.0,
+                    "final_gender": "female",
+                    "final_confidence": 0.95,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_01": "en_vctk_vits_f002"}
+
+    voice = get_voice_for_segment(
+        21.0,
+        22.0,
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert voice == "en_vctk_vits_f002"
+
+
 def test_voice_alignment_diagnostics_marks_review_reasons():
     from speaker_aware_dubbing import explain_segment_voice_alignment
 
