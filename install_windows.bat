@@ -158,6 +158,7 @@ call :run_pip_install "Install moviepy 1.0.3" "moviepy==1.0.3"
 call :run_pip_install "Install deep_translator" "deep_translator>=1.11.0,^<2.0.0"
 call :run_pip_install "Re-pin transformers 4.x" "transformers>=4.40.0,^<5.0.0"
 call :run_pip_install "Install huggingface_hub" "huggingface_hub>=0.23.0,^<2.0.0"
+call :run_pip_install "Install hf_xet for HuggingFace downloads" "hf_xet>=1.1.0"
 call :run_pip_install "Install speechbrain" "speechbrain>=1.0.0,^<2.0.0"
 call :run_pip_install "Install pyannote.audio" "pyannote.audio>=3.3.0,^<4.0.0"
 call :run_pip_install "Install Pillow" "Pillow>=9.0.0,^<11.0.0"
@@ -220,11 +221,11 @@ if not exist "%OCR_PY%" call :fail "OCR environment python not found at %OCR_PY%
 echo  [RUN] Install PaddleOCR
 "%OCR_PY%" -m pip install --upgrade pip setuptools wheel >>"%LOG_FILE%" 2>&1
 if errorlevel 1 call :fail "Failed to upgrade pip in ocr_env."
-"%OCR_PY%" -m pip install --prefer-binary paddleocr paddlepaddle opencv-python-headless >>"%LOG_FILE%" 2>&1
+"%OCR_PY%" -m pip install --prefer-binary "paddlepaddle==3.3.0" "paddleocr>=3.3.0,<3.4.0" opencv-python-headless >>"%LOG_FILE%" 2>&1
 if errorlevel 1 (
     echo  [WARN] PaddleOCR install failed on first attempt, retrying once...
     >>"%LOG_FILE%" echo [RETRY] Install PaddleOCR
-    "%OCR_PY%" -m pip install --prefer-binary paddleocr paddlepaddle opencv-python-headless >>"%LOG_FILE%" 2>&1
+    "%OCR_PY%" -m pip install --prefer-binary "paddlepaddle==3.3.0" "paddleocr>=3.3.0,<3.4.0" opencv-python-headless >>"%LOG_FILE%" 2>&1
     if errorlevel 1 call :fail "Failed to install PaddleOCR in ocr_env."
 )
 echo  [OK] PaddleOCR installed in ocr_env
@@ -249,7 +250,7 @@ call :run_python_check "Check subtitles help" "import subprocess, sys; subproces
 echo  [RUN] Check PaddleOCR import
 >>"%LOG_FILE%" echo.
 >>"%LOG_FILE%" echo [CHECK] PaddleOCR import
-"%OCR_PY%" -c "from paddleocr import PaddleOCR; import cv2; print('  [OK] PaddleOCR import')" >>"%LOG_FILE%" 2>&1
+"%OCR_PY%" -c "import os; os.environ['FLAGS_use_mkldnn']='0'; import paddle; paddle.utils.run_check(); from paddleocr import PaddleOCR; import cv2; print('  [OK] PaddleOCR import')" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 (
     echo  [ERROR] PaddleOCR import
     set "IMPORT_FAIL=1"

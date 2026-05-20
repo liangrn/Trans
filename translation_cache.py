@@ -90,10 +90,22 @@ def translate_segments_with_cache(
                 max_retries=max_retries,
                 retry_base_delay=retry_base_delay,
             )
-            cache[key] = {"status": "ok", "translated": translated}
+            cache[key] = {
+                "source_text": text,
+                "target_lang": target_lang,
+                "status": "ok",
+                "translated": translated,
+                "updated_at": time.time(),
+            }
             return idx, {**base, "translated": translated, "fallback_original": False}
         except Exception as exc:
-            cache[key] = {"status": "failed", "error": str(exc), "translated": text}
+            cache[key] = {
+                "source_text": text,
+                "target_lang": target_lang,
+                "status": "failed",
+                "error": str(exc),
+                "updated_at": time.time(),
+            }
             return idx, {
                 **base,
                 "translated": text,
@@ -111,9 +123,12 @@ def translate_segments_with_cache(
     pending = [
         {
             "idx": result["idx"],
+            "index": result["idx"],
             "text": result["text"],
+            "source_text": result["text"],
             "target_lang": target_lang,
             "error": result.get("error", ""),
+            "retry_count": max_retries,
         }
         for result in final_results
         if result.get("fallback_original")
@@ -122,6 +137,7 @@ def translate_segments_with_cache(
         "total": len(final_results),
         "success": len(final_results) - len(pending),
         "failed": len(pending),
+        "has_pending": bool(pending),
     }
     lines = [
         f"[{item['start']:.2f}-{item['end']:.2f}] {item['text']} -> {item['translated']}"
@@ -142,6 +158,41 @@ def _translate_with_retries(
     max_retries: int,
     retry_base_delay: float,
 ) -> str:
+    try:
+        return _translate_once_with_retries(
+            text,
+            target_lang,
+            translator,
+            max_retries=max_retries,
+            retry_base_delay=retry_base_delay,
+        )
+    except Exception as exc:
+        if not _should_split_text(text):
+            raise
+        translated_parts = []
+        try:
+            for part in _split_text(text):
+                translated_parts.append(
+                    _translate_once_with_retries(
+                        part,
+                        target_lang,
+                        translator,
+                        max_retries=max_retries,
+                        retry_base_delay=retry_base_delay,
+                    )
+                )
+            return " ".join(part for part in translated_parts if part)
+        except Exception:
+            raise exc
+
+
+def _translate_once_with_retries(
+    text: str,
+    target_lang: str,
+    translator: Translator,
+    max_retries: int,
+    retry_base_delay: float,
+) -> str:
     last_error: Exception | None = None
     for attempt in range(max(1, max_retries)):
         try:
@@ -152,22 +203,16 @@ def _translate_with_retries(
                 delay = retry_base_delay * (2**attempt) + random.uniform(0, retry_base_delay)
                 time.sleep(delay)
 
-    if _should_split_text(text):
-        translated_parts = []
-        for part in _split_text(text):
-            translated_parts.append(translator(part, target_lang))
-        return " ".join(part for part in translated_parts if part)
-
     raise last_error or RuntimeError("翻译失败")
 
 
 def _cache_key(text: str, target_lang: str) -> str:
-    raw = f"{target_lang}\0{text}".encode("utf-8")
+    raw = f"{target_lang}\n{text}".encode("utf-8")
     return hashlib.sha1(raw).hexdigest()
 
 
 def _should_split_text(text: str) -> bool:
-    return len(text) >= 24 and any(mark in text for mark in "，。！？；,.!?;")
+    return len(text) >= 12 and any(mark in text for mark in "，。！？；,.!?;")
 
 
 def _split_text(text: str) -> list[str]:

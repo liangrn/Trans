@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import os
+import shutil
 import time
 from typing import Any
 
@@ -126,6 +127,54 @@ def mark_stage_complete(run: PipelineRun, stage: str, data: dict[str, Any] | Non
     if data:
         payload.update(data)
     atomic_write_json(stage_dir / "stage.done.json", payload)
+
+
+def cascade_delete_dependents(run: PipelineRun, changed_stage: str) -> None:
+    """Delete stage directories that strongly depend on a stage being regenerated.
+
+    This intentionally favors correctness over maximum reuse. The caller should
+    invoke it before regenerating a stage so a crash cannot leave stale downstream
+    results available for reuse.
+    """
+    dependents = _dependent_stages_for(run, changed_stage)
+    for stage in dependents:
+        stage_dir = run.stage_dir(stage)
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir)
+
+
+def _dependent_stages_for(run: PipelineRun, changed_stage: str) -> list[str]:
+    if changed_stage == "audio":
+        stages = ["speaker_gender", "tts", "composition"]
+        recognition_source = _read_stage_source(run, "recognition")
+        if recognition_source != "ocr":
+            stages = ["recognition", "speaker_gender", "translation", "tts", "composition"]
+        return stages
+    if changed_stage == "recognition":
+        return ["translation", "tts", "composition"]
+    if changed_stage == "speaker_gender":
+        return ["tts", "composition"]
+    if changed_stage == "translation":
+        return ["tts", "composition"]
+    if changed_stage == "tts":
+        return ["composition"]
+    return []
+
+
+def _read_stage_source(run: PipelineRun, stage: str) -> str | None:
+    done_path = run.stage_dir(stage) / "stage.done.json"
+    if not done_path.exists():
+        return None
+    try:
+        done = _read_json(done_path)
+    except Exception:
+        return None
+    source = done.get("source")
+    return str(source) if source else None
+
+
+def get_stage_source(run: PipelineRun, stage: str) -> str | None:
+    return _read_stage_source(run, stage)
 
 
 def atomic_write_json(path: str | Path, data: dict[str, Any] | list[Any]) -> None:

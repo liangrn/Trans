@@ -37,6 +37,8 @@ def _safe_remove(path: str, retries: int = 5, delay: float = 0.15) -> None:
 class Config:
     SAMPLE_RATE = 16000
     MIN_DURATION = 0.5
+    MIN_SPEAKER_GENDER_SEGMENT_DURATION = 1.2
+    MIN_SPEAKER_GENDER_TOTAL_DURATION = 2.5
     GENDER_CONF_THRESHOLD = 0.55
     MAX_SEGMENTS_FOR_GENDER = 10
 
@@ -316,20 +318,36 @@ class GenderClassifier:
 
         prefix = f"[{speaker_id}]" if speaker_id else "[]"
 
-        # 过滤短片段，取最长的前 N 段
+        # Speaker 级性别只使用较长片段。短字幕切片容易受边界和背景声影响，
+        # 只能作为兜底，不参与主 speaker 投票。
         valid = sorted(
-            [(s, e) for s, e in segments if e - s >= Config.MIN_DURATION],
+            [(s, e) for s, e in segments if e - s >= Config.MIN_SPEAKER_GENDER_SEGMENT_DURATION],
             key=lambda x: x[1] - x[0], reverse=True
         )[:Config.MAX_SEGMENTS_FOR_GENDER]
 
+        total_valid_duration = sum(e - s for s, e in valid)
+        if total_valid_duration < Config.MIN_SPEAKER_GENDER_TOTAL_DURATION:
+            valid = sorted(
+                [(s, e) for s, e in segments if e - s >= Config.MIN_DURATION],
+                key=lambda x: x[1] - x[0], reverse=True
+            )[:Config.MAX_SEGMENTS_FOR_GENDER]
+            total_valid_duration = sum(e - s for s, e in valid)
+
         if not valid:
             return "unknown", 0.0, {"error": "all_segments_too_short"}
+        if total_valid_duration < Config.MIN_SPEAKER_GENDER_TOTAL_DURATION:
+            return "unknown", 0.0, {
+                "error": "insufficient_speaker_audio",
+                "total_valid_duration": total_valid_duration,
+                "segments_used": len(valid),
+            }
 
         model_ok = self.load_models()
 
         if model_ok:
             votes = {"male": 0, "female": 0}
             scores = []
+            weighted = {"male": 0.0, "female": 0.0}
             for start, end in valid:
                 seg = waveform_full[int(start * sr):int(end * sr)]
                 # 确保 16kHz
@@ -338,20 +356,37 @@ class GenderClassifier:
                 g, score = self._predict_one(seg)
                 if g:
                     votes[g] += 1
+                    weighted[g] += max(0.0, end - start) * max(0.0, score)
                     scores.append(score)
 
             total = votes["male"] + votes["female"]
             if total > 0:
-                gender = "male" if votes["male"] >= votes["female"] else "female"
+                gender = "male" if weighted["male"] >= weighted["female"] else "female"
                 base_conf = float(np.mean(scores)) if scores else 0.5
-                vote_ratio = abs(votes["male"] - votes["female"]) / total
+                weight_total = weighted["male"] + weighted["female"]
+                vote_ratio = (
+                    abs(weighted["male"] - weighted["female"]) / weight_total
+                    if weight_total > 0 else abs(votes["male"] - votes["female"]) / total
+                )
                 conf = base_conf * (0.7 + 0.3 * vote_ratio)
+                f0_gender, f0_conf, f0_details = self._classify_by_f0(waveform_full, sr, valid)
+                if f0_gender != "unknown" and f0_gender != gender and vote_ratio < 0.45:
+                    return "unknown", min(conf, f0_conf), {
+                        "method": "ecapa_f0_conflict",
+                        "votes": votes,
+                        "weighted_votes": weighted,
+                        "f0": f0_details,
+                        "segments_used": total,
+                        "total_valid_duration": total_valid_duration,
+                    }
                 gender_zh = "男" if gender == "male" else "女"
                 print(f"  {prefix} male={votes['male']} female={votes['female']} "
                       f"→ {gender_zh} (conf={conf:.2f})")
                 return gender, min(conf, 0.99), {
                     "method": "ecapa_gender",
                     "votes": votes,
+                    "weighted_votes": weighted,
+                    "total_valid_duration": total_valid_duration,
                     "segments_used": total
                 }
 

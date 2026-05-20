@@ -17,6 +17,7 @@ import tempfile
 import subprocess
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 
@@ -48,8 +49,10 @@ class Config:
     # Embedding 并行线程数
     EMBEDDING_WORKERS = 4
 
-    # 是否对每个片段独立判断性别（True=不投票聚合，解决同一 speaker 内性别不一致问题）
-    PER_SEGMENT_GENDER = True
+    # 稳定优先：性别以 speaker 级长语音聚合为准，短字幕片段只做未匹配兜底。
+    PER_SEGMENT_GENDER = False
+    MIN_SEGMENT_SPEAKER_OVERLAP = 0.25
+    MIN_SEGMENT_SPEAKER_RATIO = 0.35
 
     HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
@@ -163,9 +166,9 @@ def build_speaker_voice_map(
     female_idx = 0
     result = {}
 
-    print("[说话人识别] 声音分配:")
+    print("[说话人识别] Speaker 默认声音分配:")
     for speaker_id, info in sorted_speakers:
-        gender = info.get("gender", "unknown")
+        gender = info.get("subtitle_gender") or info.get("gender", "unknown")
         if gender == "unknown":
             gender = "female" if ("female" in fallback_voice_key or "_f0" in fallback_voice_key) else "male"
 
@@ -204,38 +207,531 @@ def get_voice_for_segment(
         return fallback_voice_key
 
     best_speaker = None
-    best_segment_gender = None
     best_overlap = 0.0
 
     for speaker_id, info in speaker_map.items():
-        # 检查是否有按片段的性别信息
-        segment_genders = info.get("segment_genders")
+        for diar_start, diar_end in info.get("segments", []):
+            overlap = max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker_id
 
-        if segment_genders:
-            # 按片段匹配
-            for seg_info in segment_genders:
-                diar_start, diar_end = seg_info["start"], seg_info["end"]
-                overlap = max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_speaker = speaker_id
-                    best_segment_gender = seg_info["gender"]
-        else:
-            # 原逻辑：按说话人匹配
-            for diar_start, diar_end in info.get("segments", []):
-                overlap = max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_speaker = speaker_id
-
-    if best_speaker is None or best_overlap < 0.15:
+    seg_duration = max(0.0, seg_end - seg_start)
+    overlap_ratio = best_overlap / seg_duration if seg_duration > 0 else 0.0
+    if (
+        best_speaker is None
+        or (
+            best_overlap < Config.MIN_SEGMENT_SPEAKER_OVERLAP
+            and overlap_ratio < Config.MIN_SEGMENT_SPEAKER_RATIO
+        )
+    ):
         return fallback_voice_key
 
-    # 如果有片段级别的性别信息，根据性别选择声音
-    if best_segment_gender and best_segment_gender != "unknown" and available_voices:
-        return _get_voice_by_gender(best_segment_gender, target_lang, available_voices, fallback_voice_key)
+    alignment = _find_subtitle_alignment(seg_start, seg_end, speaker_map.get(best_speaker, {}))
+    aligned_gender = None
+    aligned_confidence = 0.0
+    if alignment:
+        aligned_gender = (
+            alignment.get("final_gender")
+            or alignment.get("smoothed_gender")
+            or alignment.get("segment_gender")
+        )
+        aligned_confidence = alignment.get(
+            "final_confidence",
+            alignment.get("smoothed_confidence", alignment.get("segment_confidence", 0.0))
+        )
+    if (
+        aligned_gender in ("male", "female")
+        and aligned_confidence >= 0.85
+        and available_voices
+    ):
+        return _get_voice_by_gender(aligned_gender, target_lang, available_voices, fallback_voice_key)
+
+    speaker_gender = (
+        speaker_map.get(best_speaker, {}).get("subtitle_gender")
+        or speaker_map.get(best_speaker, {}).get("gender")
+    )
+    if speaker_gender in ("male", "female") and available_voices:
+        return _get_voice_by_gender(speaker_gender, target_lang, available_voices, fallback_voice_key)
 
     return speaker_voice_map.get(best_speaker, fallback_voice_key)
+
+
+def explain_segment_voice_alignment(
+    seg_start: float,
+    seg_end: float,
+    text: str,
+    speaker_map: Dict[str, Dict],
+    speaker_voice_map: Dict[str, str],
+    fallback_voice_key: str,
+    available_voices: Dict = None,
+    target_lang: str = "en",
+) -> Dict:
+    """Return diagnostic info for subtitle-to-speaker voice assignment."""
+    best_speaker = None
+    best_overlap = 0.0
+    for speaker_id, info in speaker_map.items():
+        for diar_start, diar_end in info.get("segments", []):
+            overlap = max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker_id
+
+    seg_duration = max(0.0, seg_end - seg_start)
+    overlap_ratio = best_overlap / seg_duration if seg_duration > 0 else 0.0
+    matched = (
+        best_speaker is not None
+        and (
+            best_overlap >= Config.MIN_SEGMENT_SPEAKER_OVERLAP
+            or overlap_ratio >= Config.MIN_SEGMENT_SPEAKER_RATIO
+        )
+    )
+    speaker_info = speaker_map.get(best_speaker, {}) if matched else {}
+    alignment = _find_subtitle_alignment(seg_start, seg_end, speaker_info) if matched else None
+    speaker_gender = speaker_info.get("gender", "unknown")
+    subtitle_gender = speaker_info.get("subtitle_gender", "unknown")
+    segment_gender = alignment.get("segment_gender", "unknown") if alignment else "unknown"
+    smoothed_gender = alignment.get("smoothed_gender", "unknown") if alignment else "unknown"
+    final_gender = alignment.get("final_gender", "unknown") if alignment else "unknown"
+    segment_confidence = alignment.get("segment_confidence", 0.0) if alignment else 0.0
+    final_confidence = alignment.get(
+        "final_confidence",
+        alignment.get("smoothed_confidence", segment_confidence) if alignment else 0.0,
+    ) if alignment else 0.0
+    f0_gender = alignment.get("f0_gender", "unknown") if alignment else "unknown"
+    f0_confidence = alignment.get("f0_confidence", 0.0) if alignment else 0.0
+    selected_voice = get_voice_for_segment(
+        seg_start,
+        seg_end,
+        speaker_map,
+        speaker_voice_map,
+        fallback_voice_key,
+        available_voices=available_voices,
+        target_lang=target_lang,
+    )
+    speaker_default_voice = speaker_voice_map.get(best_speaker) if matched else None
+    if not matched:
+        voice_source = "fallback"
+    elif speaker_default_voice and selected_voice == speaker_default_voice:
+        voice_source = "speaker_default"
+    elif selected_voice == fallback_voice_key and not speaker_default_voice:
+        voice_source = "fallback"
+    else:
+        voice_source = "segment_override"
+    review_reasons = _segment_review_reasons(
+        matched=matched,
+        overlap_ratio=overlap_ratio,
+        duration=seg_duration,
+        speaker_gender=speaker_gender,
+        subtitle_gender=subtitle_gender,
+        segment_gender=segment_gender,
+        segment_confidence=segment_confidence,
+        final_gender=final_gender,
+        final_confidence=final_confidence,
+        f0_gender=f0_gender,
+        f0_confidence=f0_confidence,
+        selected_voice=selected_voice,
+        fallback_voice_key=fallback_voice_key,
+    )
+    return {
+        "text": text,
+        "start": seg_start,
+        "end": seg_end,
+        "duration": seg_duration,
+        "speaker": best_speaker if matched else None,
+        "overlap": best_overlap,
+        "overlap_ratio": overlap_ratio,
+        "speaker_gender": speaker_gender,
+        "subtitle_gender": subtitle_gender,
+        "segment_gender": segment_gender,
+        "smoothed_gender": smoothed_gender,
+        "final_gender": final_gender,
+        "final_reason": alignment.get("final_reason", "unknown") if alignment else "unknown",
+        "segment_confidence": segment_confidence,
+        "final_confidence": final_confidence,
+        "f0_gender": f0_gender,
+        "f0_confidence": f0_confidence,
+        "voice": selected_voice,
+        "voice_gender": _voice_key_gender(selected_voice),
+        "voice_source": voice_source,
+        "speaker_default_voice": speaker_default_voice,
+        "needs_review": bool(review_reasons),
+        "review_reasons": review_reasons,
+    }
+
+
+def print_voice_alignment_summary(alignment_report: List[Dict], fallback_voice_key: str) -> None:
+    """Print final per-segment voice diagnostics without changing assignment logic."""
+    if not alignment_report:
+        return
+
+    voice_counts = Counter(item.get("voice", "unknown") for item in alignment_report)
+    gender_counts = Counter(item.get("voice_gender", "unknown") for item in alignment_report)
+    source_counts = Counter(item.get("voice_source", "unknown") for item in alignment_report)
+    review_count = sum(1 for item in alignment_report if item.get("needs_review"))
+    reason_counts = Counter(
+        reason
+        for item in alignment_report
+        for reason in item.get("review_reasons", [])
+    )
+
+    print("[说话人识别] 最终片段配音声音统计:")
+    print("  voice_key:")
+    for voice_key, count in sorted(voice_counts.items()):
+        print(f"    {voice_key} ({_voice_key_gender(voice_key)}): {count} 片段")
+
+    print("  voice_gender:")
+    for gender, count in sorted(gender_counts.items()):
+        gz = {"male": "男", "female": "女", "unknown": "未知"}.get(gender, gender)
+        print(f"    {gz}: {count} 片段")
+
+    print("  voice_source:")
+    source_labels = {
+        "speaker_default": "speaker 默认 voice",
+        "segment_override": "片段级 gender 覆盖",
+        "fallback": "fallback voice",
+    }
+    for source, count in sorted(source_counts.items()):
+        print(f"    {source}: {count} 片段 ({source_labels.get(source, source)})")
+
+    print(f"  needs_review: {review_count}/{len(alignment_report)}")
+    if reason_counts:
+        print("  review_reasons:")
+        for reason, count in reason_counts.most_common():
+            print(f"    {reason}: {count}")
+
+    print(f"  fallback voice: {fallback_voice_key} ({_voice_key_gender(fallback_voice_key)})")
+
+
+def _segment_review_reasons(
+    matched: bool,
+    overlap_ratio: float,
+    duration: float,
+    speaker_gender: str,
+    subtitle_gender: str,
+    segment_gender: str,
+    segment_confidence: float,
+    final_gender: str,
+    final_confidence: float,
+    f0_gender: str,
+    f0_confidence: float,
+    selected_voice: str,
+    fallback_voice_key: str,
+) -> List[str]:
+    reasons = []
+    if not matched:
+        reasons.append("no_speaker_match")
+    elif overlap_ratio < 0.5:
+        reasons.append("low_speaker_overlap")
+
+    if duration < 0.8:
+        reasons.append("short_segment")
+
+    if speaker_gender not in ("male", "female") and subtitle_gender not in ("male", "female"):
+        reasons.append("unknown_speaker_gender")
+
+    if (
+        speaker_gender in ("male", "female")
+        and segment_gender in ("male", "female")
+        and speaker_gender != segment_gender
+        and segment_confidence >= 0.85
+    ):
+        reasons.append("segment_speaker_gender_conflict")
+
+    if (
+        speaker_gender in ("male", "female")
+        and final_gender in ("male", "female")
+        and speaker_gender != final_gender
+        and final_confidence >= 0.85
+    ):
+        reasons.append("final_speaker_gender_conflict")
+
+    if (
+        segment_gender in ("male", "female")
+        and f0_gender in ("male", "female")
+        and segment_gender != f0_gender
+        and segment_confidence >= 0.75
+        and f0_confidence >= 0.65
+    ):
+        reasons.append("ecapa_f0_conflict")
+
+    if selected_voice == fallback_voice_key and not matched:
+        reasons.append("fallback_voice")
+
+    return sorted(set(reasons))
+
+
+def _voice_key_gender(voice_key: str) -> str:
+    if "_f0" in voice_key or "_female_" in voice_key:
+        return "female"
+    if "_m0" in voice_key or "_male_" in voice_key:
+        return "male"
+    return "unknown"
+
+
+def enrich_speaker_map_with_subtitle_genders(
+    audio_path: str,
+    recognized_segments: List[Dict],
+    speaker_map: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """
+    Use OCR/ASR subtitle time spans only to stabilize speaker gender assignment.
+
+    The primary speaker timeline still comes from pyannote on dialogue.wav. This
+    pass classifies each recognized subtitle span, aligns it to the best speaker
+    by overlap, and stores a conservative speaker-level subtitle_gender vote.
+    """
+    if not speaker_map or not recognized_segments:
+        return speaker_map
+
+    try:
+        import librosa
+        from gender_classifier import GenderClassifier, Config as GC
+    except Exception as e:
+        print(f"  [说话人识别] 字幕段性别校准不可用: {e}")
+        return speaker_map
+
+    try:
+        waveform, sr = librosa.load(audio_path, sr=Config.SAMPLE_RATE, mono=True)
+    except Exception as e:
+        print(f"  [说话人识别] 字幕段性别校准读取音频失败: {e}")
+        return speaker_map
+
+    classifier = GenderClassifier()
+    classifier.load_models()
+
+    votes = {sp: {"male": 0.0, "female": 0.0} for sp in speaker_map}
+    alignments = {sp: [] for sp in speaker_map}
+    all_alignments = []
+    audio_duration = len(waveform) / sr
+
+    for idx, seg in enumerate(recognized_segments):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        text = str(seg.get("text") or seg.get("original_text") or "")
+        best_speaker, best_overlap, overlap_ratio = _best_speaker_for_span(start, end, speaker_map)
+        if best_speaker is None:
+            continue
+
+        padded_start = max(0.0, start - 0.08)
+        padded_end = min(audio_duration, end + 0.08)
+        audio = waveform[int(padded_start * sr):int(padded_end * sr)]
+        gender, confidence, method, f0_gender, f0_confidence = _classify_subtitle_audio_segment(
+            classifier, audio, sr, GC
+        )
+
+        duration = max(0.0, end - start)
+        if gender in ("male", "female"):
+            votes[best_speaker][gender] += duration * max(confidence, 0.01)
+
+        alignment = {
+            "idx": seg.get("idx", idx),
+            "speaker": best_speaker,
+            "text": text,
+            "start": start,
+            "end": end,
+            "overlap": best_overlap,
+            "overlap_ratio": overlap_ratio,
+            "segment_gender": gender,
+            "segment_confidence": confidence,
+            "segment_method": method,
+            "f0_gender": f0_gender,
+            "f0_confidence": f0_confidence,
+        }
+        alignments[best_speaker].append(alignment)
+        all_alignments.append(alignment)
+
+    decoded_alignments = _decode_subtitle_gender_sequence(all_alignments, votes)
+    decoded_by_speaker = {sp: [] for sp in speaker_map}
+    for alignment in decoded_alignments:
+        decoded_by_speaker.setdefault(alignment["speaker"], []).append(alignment)
+
+    for speaker_id, info in speaker_map.items():
+        speaker_votes = votes.get(speaker_id, {"male": 0.0, "female": 0.0})
+        male_score = speaker_votes["male"]
+        female_score = speaker_votes["female"]
+        total = male_score + female_score
+        subtitle_gender = "unknown"
+        subtitle_confidence = 0.0
+        if total > 0:
+            subtitle_gender = "male" if male_score >= female_score else "female"
+            subtitle_confidence = max(male_score, female_score) / total
+        info["subtitle_gender"] = subtitle_gender if subtitle_confidence >= 0.55 else "unknown"
+        info["subtitle_gender_confidence"] = subtitle_confidence
+        info["subtitle_gender_votes"] = speaker_votes
+        info["subtitle_alignments"] = decoded_by_speaker.get(speaker_id, [])
+        if info["subtitle_gender"] != "unknown":
+            gz = "男" if info["subtitle_gender"] == "male" else "女"
+            print(f"  [字幕校准] {speaker_id}: {gz} (置信度={subtitle_confidence:.2f}, "
+                  f"男={male_score:.2f}, 女={female_score:.2f})")
+
+    return speaker_map
+
+
+def _decode_subtitle_gender_sequence(alignments: List[Dict], votes: Dict[str, Dict[str, float]]) -> List[Dict]:
+    """Decode final per-subtitle gender using acoustic evidence plus local turn continuity."""
+    ordered = [dict(item) for item in sorted(alignments, key=lambda item: (item.get("start", 0.0), item.get("end", 0.0)))]
+
+    speaker_dominant = {}
+    for speaker_id, speaker_votes in votes.items():
+        male_score = speaker_votes.get("male", 0.0)
+        female_score = speaker_votes.get("female", 0.0)
+        if male_score + female_score <= 0:
+            speaker_dominant[speaker_id] = "unknown"
+        else:
+            speaker_dominant[speaker_id] = "male" if male_score >= female_score else "female"
+
+    for item in ordered:
+        gender = item.get("segment_gender", "unknown")
+        confidence = float(item.get("segment_confidence", 0.0) or 0.0)
+        item["final_gender"] = gender if gender in ("male", "female") and confidence >= 0.85 else "unknown"
+        item["final_confidence"] = confidence if item["final_gender"] != "unknown" else 0.0
+        item["final_reason"] = "segment" if item["final_gender"] != "unknown" else "unknown"
+
+    # If pyannote starts a long same-speaker turn slightly late/early, the first
+    # one or two subtitle snippets can be classified like the previous speaker.
+    # Correct only the start of a speaker-local run with enough following
+    # evidence. Do not let the speaker majority override arbitrary middle spans.
+    by_speaker = {}
+    for item in ordered:
+        by_speaker.setdefault(item.get("speaker"), []).append(item)
+    for speaker_id, speaker_items in by_speaker.items():
+        dominant = speaker_dominant.get(speaker_id, "unknown")
+        if dominant not in ("male", "female") or len(speaker_items) < 4:
+            continue
+        for idx, item in enumerate(speaker_items[:2]):
+            if item.get("final_gender") == dominant:
+                continue
+            later = speaker_items[idx + 1:idx + 5]
+            close_later = [
+                candidate for candidate in later
+                if candidate.get("start", 0.0) - item.get("end", 0.0) <= 5.0
+            ]
+            dominant_later = sum(1 for candidate in close_later if candidate.get("final_gender") == dominant)
+            if dominant_later >= 2:
+                item["final_gender"] = dominant
+                item["final_confidence"] = max(float(item.get("final_confidence", 0.0) or 0.0), 0.86)
+                item["final_reason"] = "speaker_turn_start"
+
+    # Local continuity: fix only an isolated flip between same-gender neighbors.
+    # This avoids sequence-level drift across real speaker changes.
+    for idx, item in enumerate(ordered):
+        gender = item.get("final_gender")
+        if gender not in ("male", "female"):
+            continue
+
+        if 0 < idx < len(ordered) - 1:
+            prev_item = ordered[idx - 1]
+            next_item = ordered[idx + 1]
+            prev_gender = prev_item.get("final_gender")
+            next_gender = next_item.get("final_gender")
+            if (
+                prev_gender == next_gender
+                and prev_gender in ("male", "female")
+                and prev_gender != gender
+                and item.get("start", 0.0) - prev_item.get("end", 0.0) <= 1.5
+                and next_item.get("start", 0.0) - item.get("end", 0.0) <= 1.5
+            ):
+                item["final_gender"] = prev_gender
+                item["final_confidence"] = max(float(item.get("final_confidence", 0.0) or 0.0), 0.86)
+                item["final_reason"] = "between_same_neighbors"
+
+    return ordered
+
+
+def _smooth_subtitle_alignments(alignments: List[Dict], dominant_gender: str = "unknown") -> List[Dict]:
+    """Correct isolated high-confidence segment flips within a local speaker run."""
+    ordered = sorted(alignments, key=lambda item: (item.get("start", 0.0), item.get("end", 0.0)))
+    result = []
+    for idx, item in enumerate(ordered):
+        current = dict(item)
+        current_gender = current.get("segment_gender", "unknown")
+        current_conf = float(current.get("segment_confidence", 0.0) or 0.0)
+        current["smoothed_gender"] = current_gender
+        current["smoothed_confidence"] = current_conf
+        current["smooth_reason"] = "segment"
+
+        if idx >= 2 and current_gender in ("male", "female"):
+            prev_1 = result[idx - 1]
+            prev_2 = result[idx - 2]
+            prev_gender_1 = prev_1.get("smoothed_gender") or prev_1.get("segment_gender")
+            prev_gender_2 = prev_2.get("smoothed_gender") or prev_2.get("segment_gender")
+            gap_1 = float(current.get("start", 0.0)) - float(prev_1.get("end", 0.0))
+            gap_2 = float(prev_1.get("start", 0.0)) - float(prev_2.get("end", 0.0))
+            if (
+                prev_gender_1 == prev_gender_2
+                and prev_gender_1 in ("male", "female")
+                and prev_gender_1 == dominant_gender
+                and prev_gender_1 != current_gender
+                and gap_1 <= 1.5
+                and gap_2 <= 1.5
+            ):
+                current["smoothed_gender"] = prev_gender_1
+                current["smoothed_confidence"] = max(
+                    current_conf,
+                    float(prev_1.get("smoothed_confidence", prev_1.get("segment_confidence", 0.0)) or 0.0),
+                    float(prev_2.get("smoothed_confidence", prev_2.get("segment_confidence", 0.0)) or 0.0),
+                )
+                current["smooth_reason"] = "previous_two_segments"
+
+        result.append(current)
+    return result
+
+
+def _classify_subtitle_audio_segment(classifier, audio, sr, gender_config):
+    if audio is None or len(audio) == 0:
+        return "unknown", 0.0, "empty", "unknown", 0.0
+
+    ecapa_gender, ecapa_confidence = (None, 0.0)
+    if classifier._model_ready is None:
+        classifier.load_models()
+    if classifier._model_ready:
+        ecapa_gender, ecapa_confidence = classifier._predict_one(audio)
+
+    f0_gender, f0_confidence = classifier._classify_segment_by_f0(audio, sr)
+
+    if ecapa_gender in ("male", "female") and ecapa_confidence >= 0.85:
+        return ecapa_gender, ecapa_confidence, "ecapa", f0_gender, f0_confidence
+    if f0_gender in ("male", "female") and f0_confidence >= 0.65:
+        return f0_gender, f0_confidence, "f0", f0_gender, f0_confidence
+    return "unknown", 0.0, "unknown", f0_gender, f0_confidence
+
+
+def _best_speaker_for_span(seg_start: float, seg_end: float, speaker_map: Dict[str, Dict]):
+    best_speaker = None
+    best_overlap = 0.0
+    for speaker_id, info in speaker_map.items():
+        total_overlap = 0.0
+        for diar_start, diar_end in info.get("segments", []):
+            total_overlap += max(0.0, min(seg_end, diar_end) - max(seg_start, diar_start))
+        if total_overlap > best_overlap:
+            best_overlap = total_overlap
+            best_speaker = speaker_id
+
+    seg_duration = max(0.0, seg_end - seg_start)
+    overlap_ratio = best_overlap / seg_duration if seg_duration > 0 else 0.0
+    if (
+        best_speaker is None
+        or (
+            best_overlap < Config.MIN_SEGMENT_SPEAKER_OVERLAP
+            and overlap_ratio < Config.MIN_SEGMENT_SPEAKER_RATIO
+        )
+    ):
+        return None, best_overlap, overlap_ratio
+    return best_speaker, best_overlap, overlap_ratio
+
+
+def _find_subtitle_alignment(seg_start: float, seg_end: float, speaker_info: Dict) -> Optional[Dict]:
+    best = None
+    best_delta = None
+    for alignment in speaker_info.get("subtitle_alignments", []):
+        delta = abs(float(alignment.get("start", 0.0)) - seg_start) + abs(float(alignment.get("end", 0.0)) - seg_end)
+        if best_delta is None or delta < best_delta:
+            best = alignment
+            best_delta = delta
+    if best is not None and best_delta is not None and best_delta <= 0.25:
+        return best
+    return None
 
 
 def _get_voice_by_gender(

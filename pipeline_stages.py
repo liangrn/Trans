@@ -10,13 +10,20 @@ import time
 from audio_separation import SeparationResult, separate_vocals_and_background
 from asr_recognition import transcribe_chinese_audio
 from ocr_recognition import get_ocr_subtitle_segments
-from pipeline_cache import PipelineRun, atomic_write_json, is_stage_complete, mark_stage_complete
+from pipeline_cache import (
+    PipelineRun,
+    atomic_write_json,
+    cascade_delete_dependents,
+    is_stage_complete,
+    mark_stage_complete,
+)
 from stage_validators import (
     validate_audio_stage,
     validate_segments_list,
     validate_recognition_stage,
     validate_composition_stage,
     validate_speaker_gender_stage,
+    validate_tts_stage,
     validate_translation_stage,
 )
 from translation_cache import translate_segments_with_cache, translate_text_with_google
@@ -45,6 +52,7 @@ def get_or_create_audio_stage(
             )
         print(f"  - 音频分离阶段无效，重新生成: {reason}")
 
+    cascade_delete_dependents(run, "audio")
     _reset_stage_dir(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     work_dir = stage_dir / "_work"
@@ -81,6 +89,7 @@ def get_or_create_recognition_stage(
     input_video_path: str,
     video_duration: float,
     asr_audio_path: str | None = None,
+    try_ocr: bool = True,
 ) -> list[dict]:
     stage_dir = run.stage_dir("recognition")
     segments_path = stage_dir / "recognized_segments.json"
@@ -93,13 +102,16 @@ def get_or_create_recognition_stage(
             return json.loads(segments_path.read_text(encoding="utf-8"))
         print(f"  - 文本识别阶段无效，重新生成: {reason}")
 
+    cascade_delete_dependents(run, "recognition")
     _reset_stage_dir(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
-    ocr_segments = get_ocr_subtitle_segments(
-        input_video_path,
-        video_duration,
-        cache_dir=stage_dir / "blocks",
-    )
+    ocr_segments = []
+    if try_ocr:
+        ocr_segments = get_ocr_subtitle_segments(
+            input_video_path,
+            video_duration,
+            cache_dir=stage_dir / "blocks",
+        )
     if ocr_segments:
         segments = ocr_segments
         source = "ocr"
@@ -139,6 +151,7 @@ def get_or_create_translation_stage(
             return json.loads(translated_path.read_text(encoding="utf-8"))
         print(f"  - 翻译阶段需要回补/重建: {reason}")
 
+    cascade_delete_dependents(run, "translation")
     started = time.time()
     results = translate_segments_with_cache(
         segments,
@@ -171,6 +184,7 @@ def get_or_create_speaker_gender_stage(run: PipelineRun, wait_func) -> dict:
             return json.loads(output_path.read_text(encoding="utf-8"))
         print(f"  - 说话人/男女声阶段无效，重新生成: {reason}")
 
+    cascade_delete_dependents(run, "speaker_gender")
     _reset_stage_dir(stage_dir)
     speaker_map = wait_func()
     atomic_write_json(output_path, speaker_map)
@@ -198,11 +212,24 @@ def mark_tts_stage_complete(
         atomic_write_json(timeline_path, timeline)
         outputs.append(str(timeline_path))
 
+    if timeline is not None:
+        valid, reason = validate_tts_stage(segments_path, timeline_path)
+        if not valid:
+            raise RuntimeError(f"TTS 阶段产物无效: {reason}")
+
     mark_stage_complete(run, "tts", {"outputs": outputs})
 
 
-def mark_composition_stage_complete(run: PipelineRun, output_video_path: str) -> None:
-    valid, reason = validate_composition_stage(output_video_path)
+def invalidate_composition_for_tts(run: PipelineRun) -> None:
+    cascade_delete_dependents(run, "tts")
+
+
+def mark_composition_stage_complete(
+    run: PipelineRun,
+    output_video_path: str,
+    expected_min_duration: float | None = None,
+) -> None:
+    valid, reason = validate_composition_stage(output_video_path, expected_min_duration=expected_min_duration)
     if not valid:
         raise RuntimeError(f"最终合成产物无效: {reason}")
     mark_stage_complete(run, "composition", {"outputs": [output_video_path]})

@@ -88,6 +88,274 @@ def test_default_voice_exists_in_voice_table():
     assert '"en_vctk_vits_m001":' in text
 
 
+def test_speaker_voice_mapping_uses_subtitle_gender_before_raw_speaker_gender():
+    from speaker_aware_dubbing import build_speaker_voice_map
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "female",
+            "subtitle_gender": "male",
+            "total_duration": 3.0,
+        }
+    }
+
+    result = build_speaker_voice_map(speaker_map, "en", voices, "en_vctk_vits_m001")
+
+    assert result["SPEAKER_00"] == "en_vctk_vits_m001"
+
+
+def test_segment_voice_uses_speaker_gender_not_short_segment_female():
+    from speaker_aware_dubbing import get_voice_for_segment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "female",
+            "subtitle_gender": "male",
+            "segments": [(8.5, 15.0)],
+            "subtitle_alignments": [
+                {
+                    "start": 8.89,
+                    "end": 9.55,
+                    "segment_gender": "male",
+                    "smoothed_gender": "male",
+                    "segment_confidence": 0.90,
+                    "smoothed_confidence": 0.90,
+                },
+                {
+                    "start": 12.55,
+                    "end": 13.55,
+                    "segment_gender": "male",
+                    "smoothed_gender": "male",
+                    "segment_confidence": 0.90,
+                    "smoothed_confidence": 0.90,
+                },
+                {
+                    "start": 14.2,
+                    "end": 15.5,
+                    "segment_gender": "female",
+                    "smoothed_gender": "male",
+                    "segment_confidence": 0.90,
+                    "smoothed_confidence": 0.90,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_00": "en_vctk_vits_m001"}
+
+    voice = get_voice_for_segment(
+        14.2,
+        15.5,
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert voice == "en_vctk_vits_m001"
+
+
+def test_strong_male_subtitle_segment_can_override_female_speaker_vote():
+    from speaker_aware_dubbing import get_voice_for_segment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_04": {
+            "gender": "female",
+            "subtitle_gender": "female",
+            "segments": [(7.15, 7.86)],
+            "subtitle_alignments": [
+                {
+                    "start": 7.22,
+                    "end": 8.22,
+                    "segment_gender": "male",
+                    "segment_confidence": 0.90,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_04": "en_vctk_vits_f001"}
+
+    voice = get_voice_for_segment(
+        7.22,
+        8.22,
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert voice == "en_vctk_vits_m001"
+
+
+def test_voice_alignment_diagnostics_marks_review_reasons():
+    from speaker_aware_dubbing import explain_segment_voice_alignment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "female",
+            "subtitle_gender": "female",
+            "segments": [(10.0, 10.35)],
+            "subtitle_alignments": [
+                {
+                    "start": 10.0,
+                    "end": 10.7,
+                    "segment_gender": "male",
+                    "segment_confidence": 0.90,
+                    "final_gender": "male",
+                    "final_confidence": 0.90,
+                    "final_reason": "segment",
+                    "f0_gender": "female",
+                    "f0_confidence": 0.70,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_00": "en_vctk_vits_f001"}
+
+    report = explain_segment_voice_alignment(
+        10.0,
+        10.79,
+        "短句",
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert report["voice"] == "en_vctk_vits_m001"
+    assert report["voice_gender"] == "male"
+    assert report["voice_source"] == "segment_override"
+    assert report["speaker_default_voice"] == "en_vctk_vits_f001"
+    assert report["needs_review"] is True
+    assert "short_segment" in report["review_reasons"]
+    assert "low_speaker_overlap" in report["review_reasons"]
+    assert "segment_speaker_gender_conflict" in report["review_reasons"]
+    assert "ecapa_f0_conflict" in report["review_reasons"]
+
+
+def test_voice_alignment_diagnostics_marks_speaker_default_source():
+    from speaker_aware_dubbing import explain_segment_voice_alignment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "female",
+            "subtitle_gender": "female",
+            "segments": [(1.0, 3.0)],
+            "subtitle_alignments": [],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_00": "en_vctk_vits_f001"}
+
+    report = explain_segment_voice_alignment(
+        1.2,
+        2.4,
+        "默认女声",
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert report["voice"] == "en_vctk_vits_f001"
+    assert report["voice_source"] == "speaker_default"
+    assert report["speaker_default_voice"] == "en_vctk_vits_f001"
+
+
+def test_voice_alignment_diagnostics_marks_fallback_source():
+    from speaker_aware_dubbing import explain_segment_voice_alignment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "female",
+            "subtitle_gender": "female",
+            "segments": [(20.0, 21.0)],
+            "subtitle_alignments": [],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_00": "en_vctk_vits_f001"}
+
+    report = explain_segment_voice_alignment(
+        1.0,
+        2.0,
+        "无匹配",
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert report["voice"] == "en_vctk_vits_m001"
+    assert report["voice_source"] == "fallback"
+    assert report["speaker_default_voice"] is None
+    assert "fallback_voice" in report["review_reasons"]
+
+
+def test_voice_alignment_summary_prints_final_voice_counts(capsys):
+    from speaker_aware_dubbing import print_voice_alignment_summary
+
+    print_voice_alignment_summary(
+        [
+            {
+                "voice": "en_vctk_vits_f001",
+                "voice_gender": "female",
+                "voice_source": "speaker_default",
+                "needs_review": False,
+                "review_reasons": [],
+            },
+            {
+                "voice": "en_vctk_vits_m001",
+                "voice_gender": "male",
+                "voice_source": "segment_override",
+                "needs_review": True,
+                "review_reasons": ["final_speaker_gender_conflict"],
+            },
+            {
+                "voice": "en_vctk_vits_m001",
+                "voice_gender": "male",
+                "voice_source": "fallback",
+                "needs_review": True,
+                "review_reasons": ["fallback_voice"],
+            },
+        ],
+        "en_vctk_vits_m001",
+    )
+
+    output = capsys.readouterr().out
+    assert "最终片段配音声音统计" in output
+    assert "en_vctk_vits_f001 (female): 1 片段" in output
+    assert "en_vctk_vits_m001 (male): 2 片段" in output
+    assert "segment_override: 1" in output
+    assert "fallback voice: en_vctk_vits_m001 (male)" in output
+
+
 def test_runtime_and_windows_install_are_cpu_only():
     root = Path(__file__).resolve().parents[1]
     checked_files = [

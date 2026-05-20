@@ -36,13 +36,14 @@ except ImportError as _mpy_err:
     )
 
 from PIL import Image, ImageDraw, ImageFont
-from pipeline_cache import get_pipeline_run
+from pipeline_cache import get_pipeline_run, get_stage_source
 from pipeline_cache import is_stage_complete
 from pipeline_stages import (
     get_or_create_audio_stage,
     get_or_create_recognition_stage,
     get_or_create_speaker_gender_stage,
     get_or_create_translation_stage,
+    invalidate_composition_for_tts,
     mark_composition_stage_complete,
     mark_tts_stage_complete,
 )
@@ -57,6 +58,9 @@ try:
         wait_diarization,
         build_speaker_voice_map,
         get_voice_for_segment,
+        explain_segment_voice_alignment,
+        print_voice_alignment_summary,
+        enrich_speaker_map_with_subtitle_genders,
     )
     SPEAKER_AWARE_AVAILABLE = True
 except ImportError as _e:
@@ -89,6 +93,14 @@ def _safe_remove(path: str, retries: int = 5, delay: float = 0.15) -> None:
 # - 使用环境变量 `FFMPEG_BIN` 覆盖 ffmpeg 可执行文件
 # - 使用环境变量 `SUBTITLE_FONT_PATH` 指定优先使用的字体文件路径
 FONT_PATH_OVERRIDE = os.environ.get('SUBTITLE_FONT_PATH', None)
+_SUBTITLE_FONT_CACHE = {}
+_SUBTITLE_FONT_LOGGED = set()
+
+
+def _subtitle_font_log_once(key, message):
+    if key not in _SUBTITLE_FONT_LOGGED:
+        print(message)
+        _SUBTITLE_FONT_LOGGED.add(key)
 
 def _resolve_ffmpeg_bin() -> str:
     """解析 ffmpeg 可执行文件路径，优先级：
@@ -459,7 +471,11 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
     def generate_one(seg_data, idx):
         """生成单个 TTS 音频"""
         try:
+            seg_data.setdefault("_tts_model_name", getattr(tts_model, "_model_name", None))
+            seg_data.setdefault("_speaker_wav", getattr(tts_model, "_speaker_wav", None))
+            seg_data.setdefault("_tts_language", getattr(tts_model, "_xtts_language", None))
             if cache_path:
+                cache_digest = _build_tts_cache_digest(seg_data, idx, speaker_idx, target_lang)
                 temp_tts_file = str(cache_path / _build_tts_cache_filename(seg_data, idx, speaker_idx, target_lang))
                 if os.path.exists(temp_tts_file) and os.path.getsize(temp_tts_file) > 512:
                     if _is_valid_cached_tts_file(temp_tts_file):
@@ -469,9 +485,11 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
                             "seg_data": seg_data,
                             "success": True,
                             "cached": True,
+                            "cache_digest": cache_digest,
                         }
                     _safe_remove(temp_tts_file)
             else:
+                cache_digest = _build_tts_cache_digest(seg_data, idx, speaker_idx, target_lang)
                 tmp_orig = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
                 temp_tts_file = tmp_orig.name
                 tmp_orig.close()
@@ -491,6 +509,7 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
                 "seg_data": seg_data,
                 "success": True,
                 "cached": False,
+                "cache_digest": cache_digest,
             }
         except Exception as e:
             print(f"    - 片段 {idx} TTS 生成失败: {e}")
@@ -541,24 +560,35 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
 
 
 def _build_tts_cache_filename(seg_data, idx, speaker_idx, target_lang):
+    stable_idx = _stable_tts_segment_idx(seg_data, idx)
+    digest = _build_tts_cache_digest(seg_data, idx, speaker_idx, target_lang)
+    return f"segment_{stable_idx:04d}_{digest}.wav"
+
+
+def _stable_tts_segment_idx(seg_data, idx):
     stable_idx = seg_data.get("idx", idx)
     try:
-        stable_idx = int(stable_idx)
+        return int(stable_idx)
     except (TypeError, ValueError):
-        stable_idx = idx
+        return idx
 
+
+def _build_tts_cache_digest(seg_data, idx, speaker_idx, target_lang):
     text = seg_data.get("translated_text") or seg_data.get("text") or ""
     payload = json.dumps(
         {
             "target_lang": target_lang,
             "speaker_idx": speaker_idx,
+            "model_name": seg_data.get("_tts_model_name"),
+            "speaker_wav": seg_data.get("_speaker_wav"),
+            "tts_language": seg_data.get("_tts_language"),
+            "voice_key": seg_data.get("_voice_key"),
             "text": text,
         },
         ensure_ascii=False,
         sort_keys=True,
     )
-    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
-    return f"segment_{stable_idx:04d}_{digest}.wav"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def _is_valid_cached_tts_file(path):
@@ -593,6 +623,8 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
         tts = TTS(model_name=model_name, progress_bar=True, gpu=False)
         # 将 xtts_language 存入模型实例，供 synthesize_speech_coqui_single 使用
         tts._xtts_language = xtts_language
+        tts._model_name = model_name
+        tts._speaker_wav = voice_config.get("speaker_wav")
         return tts, speaker_idx
     except Exception as e:
         # 明确警告：不再静默，避免用户不知情地收到英语配音
@@ -609,6 +641,8 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
         try:
             tts = TTS(model_name=FALLBACK_MODEL, progress_bar=True, gpu=False)
             tts._xtts_language = None
+            tts._model_name = FALLBACK_MODEL
+            tts._speaker_wav = None
             tts._is_fallback = True  # 标记为降级，供上层判断
             return tts, None
         except Exception as e2:
@@ -748,6 +782,11 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
     # ========== 2. 创建透明背景 ==========
     subtitle_img = Image.new('RGBA', (img_width, estimated_height), color=(0, 0, 0, 0))
     draw = ImageDraw.Draw(subtitle_img)
+
+    import sys
+    font_cache_key = (sys.platform, base_lang, font_size, FONT_PATH_OVERRIDE or "")
+    cached_font = _SUBTITLE_FONT_CACHE.get(font_cache_key)
+
     # ========== 3. 修复字体加载函数 ==========
     def get_font_for_mac(size):
         """Mac专用字体加载"""
@@ -772,13 +811,13 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         # 优先尝试外部指定的字体路径（环境变量或命令行传入）
         if FONT_PATH_OVERRIDE and os.path.exists(FONT_PATH_OVERRIDE):
             try:
-                print(f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
+                _subtitle_font_log_once(("try", FONT_PATH_OVERRIDE, size), f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
                 # 对于 .ttc/.ttf 都尝试直接加载
                 font = ImageFont.truetype(FONT_PATH_OVERRIDE, size=size)
-                print(f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
+                _subtitle_font_log_once(("ok", FONT_PATH_OVERRIDE, size), f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
                 return font
             except Exception as e:
-                print(f"    - 覆盖字体加载失败: {e}")
+                _subtitle_font_log_once(("fail", FONT_PATH_OVERRIDE, size), f"    - 覆盖字体加载失败: {e}")
         
         for font_path in mac_font_paths:
             if os.path.exists(font_path):
@@ -806,10 +845,10 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
                             #print(f"    - 成功加载: {os.path.basename(font_path)}")
                             return font
                 except Exception as e:
-                    print(f"    - 加载失败 {os.path.basename(font_path)}: {e}")
+                    _subtitle_font_log_once(("fail", font_path, size), f"    - 加载失败 {os.path.basename(font_path)}: {e}")
                     continue
         # 如果所有字体都失败，返回默认字体
-        print("    - 使用PIL默认字体")
+        _subtitle_font_log_once(("default", "mac", size), "    - 使用PIL默认字体")
         return ImageFont.load_default()
 
     def get_font_for_windows(size):
@@ -819,12 +858,12 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         # ① 最高优先级：用户通过环境变量或命令行指定的自定义字体
         if FONT_PATH_OVERRIDE and os.path.exists(FONT_PATH_OVERRIDE):
             try:
-                print(f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
+                _subtitle_font_log_once(("try", FONT_PATH_OVERRIDE, size), f"    - 尝试加载覆盖字体: {os.path.basename(FONT_PATH_OVERRIDE)}")
                 font = ImageFont.truetype(FONT_PATH_OVERRIDE, size=size)
-                print(f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
+                _subtitle_font_log_once(("ok", FONT_PATH_OVERRIDE, size), f"    - 成功加载覆盖字体: {FONT_PATH_OVERRIDE}")
                 return font
             except Exception as e:
-                print(f"    - 覆盖字体加载失败（将继续尝试系统字体）: {e}")
+                _subtitle_font_log_once(("fail", FONT_PATH_OVERRIDE, size), f"    - 覆盖字体加载失败（将继续尝试系统字体）: {e}")
 
         # ② 系统字体目录扫描
         windows_dirs = [
@@ -849,7 +888,7 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
                     font_path = os.path.join(font_dir, font_name)
                     if os.path.exists(font_path):
                         try:
-                            print(f"    - 尝试加载: {font_name}")
+                            _subtitle_font_log_once(("try", font_path, size), f"    - 尝试加载: {font_name}")
                             if font_name.endswith('.ttc'):
                                 font = ImageFont.truetype(font_path, size=size, index=0)
                             else:
@@ -857,26 +896,29 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
                             # 测试字体可正常渲染
                             bbox = font.getbbox("Test")
                             if bbox:
-                                print(f"    - 成功加载: {font_name}")
+                                _subtitle_font_log_once(("ok", font_path, size), f"    - 成功加载: {font_name}")
                                 return font
                         except Exception as e:
-                            print(f"    - 加载失败 {font_name}: {e}")
+                            _subtitle_font_log_once(("fail", font_path, size), f"    - 加载失败 {font_name}: {e}")
                             continue
 
-        print("    - 使用PIL默认字体")
+        _subtitle_font_log_once(("default", "windows", size), "    - 使用PIL默认字体")
         return ImageFont.load_default()
 
     # 根据系统选择字体加载函数
-    import sys
-    if sys.platform == 'darwin':
-        #print("    - 系统: macOS")
-        font = get_font_for_mac(font_size)
-    elif sys.platform.startswith('win'):
-        #print("    - 系统: Windows")
-        font = get_font_for_windows(font_size)
+    if cached_font is not None:
+        font = cached_font
     else:
-        #print("    - 系统: Linux/其他")
-        font = ImageFont.load_default()
+        if sys.platform == 'darwin':
+            #print("    - 系统: macOS")
+            font = get_font_for_mac(font_size)
+        elif sys.platform.startswith('win'):
+            #print("    - 系统: Windows")
+            font = get_font_for_windows(font_size)
+        else:
+            #print("    - 系统: Linux/其他")
+            font = ImageFont.load_default()
+        _SUBTITLE_FONT_CACHE[font_cache_key] = font
 
     # ========== 4. 确保font是有效的字体对象 ==========
     if font is None or not hasattr(font, 'getbbox'):
@@ -1115,29 +1157,47 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         print("\n[1/6] 文本识别...")
         
         try:
-            # OCR 和音频分离互不依赖，先并行启动；只有 OCR 不可用时才等待 dialogue.wav 做 ASR。
-            with ThreadPoolExecutor(max_workers=2) as stage_executor:
-                audio_future = stage_executor.submit(
-                    get_or_create_audio_stage, pipeline_run, input_video_path, video_duration
-                )
-                recognition_future = stage_executor.submit(
-                    get_or_create_recognition_stage,
+            audio_stage_dir = pipeline_run.stage_dir("audio")
+            audio_stage_ready = is_stage_complete(
+                pipeline_run,
+                "audio",
+                [audio_stage_dir / "background.wav", audio_stage_dir / "dialogue.wav"],
+            )
+            recognition_source = get_stage_source(pipeline_run, "recognition")
+
+            if not audio_stage_ready and recognition_source != "ocr":
+                separation_result = get_or_create_audio_stage(pipeline_run, input_video_path, video_duration)
+                segments = get_or_create_recognition_stage(
                     pipeline_run,
                     input_video_path,
                     video_duration,
-                    None,
+                    separation_result.dialogue_path,
                 )
-                try:
-                    segments = recognition_future.result()
-                    separation_result = audio_future.result()
-                except Exception:
-                    separation_result = audio_future.result()
-                    segments = get_or_create_recognition_stage(
+            else:
+                # OCR 和音频分离互不依赖，先并行启动；只有 OCR 不可用时才等待 dialogue.wav 做 ASR。
+                with ThreadPoolExecutor(max_workers=2) as stage_executor:
+                    audio_future = stage_executor.submit(
+                        get_or_create_audio_stage, pipeline_run, input_video_path, video_duration
+                    )
+                    recognition_future = stage_executor.submit(
+                        get_or_create_recognition_stage,
                         pipeline_run,
                         input_video_path,
                         video_duration,
-                        separation_result.dialogue_path,
+                        None,
                     )
+                    try:
+                        segments = recognition_future.result()
+                        separation_result = audio_future.result()
+                    except Exception:
+                        separation_result = audio_future.result()
+                        segments = get_or_create_recognition_stage(
+                            pipeline_run,
+                            input_video_path,
+                            video_duration,
+                            separation_result.dialogue_path,
+                            try_ocr=False,
+                        )
 
             asr_audio_path = separation_result.dialogue_path
             background_audio_path = separation_result.background_path
@@ -1215,6 +1275,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         )
         for result in translated_results:
             translated_segments_data.append({
+                "idx": result.get("idx"),
                 "original_text": result["text"],
                 "translated_text": result["translated"],
                 "original_duration": result["duration"],
@@ -1225,6 +1286,11 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         # ===== 分配说话人声音 =====
         if SPEAKER_AWARE_AVAILABLE and speaker_map:
             print('\n[3/6] 分配说话人声音...')
+            speaker_map = enrich_speaker_map_with_subtitle_genders(
+                asr_audio_path,
+                original_segments_data,
+                speaker_map,
+            )
             speaker_voice_map = build_speaker_voice_map(
                 speaker_map, target_language, available_voices, selected_voice_key
             )
@@ -1243,11 +1309,13 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         # Step 5: 生成并调整TTS音频
         print("\n[5/6] 生成并调整配音音频...")
+        invalidate_composition_for_tts(pipeline_run)
 
         # 5.1 并行生成所有 TTS 音频
         # 说话人感知：为每个片段标记对应的 voice_key
         tts_cache_dir = pipeline_run.stage_dir("tts") / "clips"
         if SPEAKER_AWARE_AVAILABLE and speaker_map and speaker_voice_map:
+            voice_alignment_report = []
             for seg in translated_segments_data:
                 seg['_voice_key'] = get_voice_for_segment(
                     seg['start'], seg['end'],
@@ -1255,6 +1323,20 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                     available_voices=available_voices,
                     target_lang=target_language
                 )
+                voice_alignment_report.append(explain_segment_voice_alignment(
+                    seg['start'], seg['end'],
+                    seg.get('original_text') or seg.get('translated_text', ''),
+                    speaker_map, speaker_voice_map, selected_voice_key,
+                    available_voices=available_voices,
+                    target_lang=target_language,
+                ))
+            print_voice_alignment_summary(voice_alignment_report, selected_voice_key)
+            try:
+                diagnostics_path = pipeline_run.stage_dir("speaker_gender") / "aligned_segments.json"
+                from pipeline_cache import atomic_write_json
+                atomic_write_json(diagnostics_path, voice_alignment_report)
+            except Exception as e:
+                print(f"  [说话人识别] 对齐诊断写入失败: {e}")
             # 按 voice_key 分组，每组用自己的 TTS 模型生成
             tts_results, tts_temp_files = _generate_tts_multi_voice(
                 translated_segments_data, target_language,
@@ -1273,6 +1355,14 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             result for result in tts_results
             if result and result.get("success") and result.get("temp_tts_file")
         ]
+        if len(successful_tts_results) != len(translated_segments_data):
+            failed_indexes = [
+                str(result.get("idx", idx)) if result else str(idx)
+                for idx, result in enumerate(tts_results)
+                if not (result and result.get("success") and result.get("temp_tts_file"))
+            ]
+            print(f"  - TTS 生成不完整，失败片段: {', '.join(failed_indexes)}")
+            return False
         if not successful_tts_results:
             print("  - TTS 未生成任何有效音频片段")
             return False
@@ -1388,6 +1478,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                     "idx": result.get("idx"),
                     "path": result.get("temp_tts_file"),
                     "success": result.get("success"),
+                    "cache_digest": result.get("cache_digest"),
                 }
                 for result in tts_results
                 if result
@@ -1455,7 +1546,11 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 file_size = os.path.getsize(output_video_path)
                 if file_size > 10240:  # 大于10KB
                     print(f"  - ✓ 文件写入成功: {file_size/1024/1024:.1f} MB")
-                    mark_composition_stage_complete(pipeline_run, output_video_path)
+                    mark_composition_stage_complete(
+                        pipeline_run,
+                        output_video_path,
+                        expected_min_duration=final_output_duration,
+                    )
                     return True
                 else:
                     print(f"  - ✗ 输出文件过小: {file_size} bytes")
