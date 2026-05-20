@@ -7,7 +7,11 @@ pipeline yet.
 import argparse
 import difflib
 import json
+import os
 from pathlib import Path
+
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
 
 import cv2
 
@@ -34,6 +38,8 @@ def main() -> int:
     parser.add_argument("--fast_interval", type=float, default=0.75)
     parser.add_argument("--crop_top", type=float, default=0.58)
     parser.add_argument("--min_conf", type=float, default=0.55)
+    parser.add_argument("--start_time", type=float, default=0.0)
+    parser.add_argument("--end_time", type=float, default=None)
     args = parser.parse_args()
 
     segments = extract_hard_subtitles(
@@ -42,6 +48,8 @@ def main() -> int:
         fast_interval=args.fast_interval,
         crop_top=args.crop_top,
         min_conf=args.min_conf,
+        start_time=args.start_time,
+        end_time=args.end_time,
     )
     Path(args.output_json).write_text(
         json.dumps(segments, ensure_ascii=False, indent=2),
@@ -55,7 +63,15 @@ def main() -> int:
     return 0
 
 
-def extract_hard_subtitles(video_path: str, interval: float, fast_interval: float, crop_top: float, min_conf: float) -> list[dict]:
+def extract_hard_subtitles(
+    video_path: str,
+    interval: float,
+    fast_interval: float,
+    crop_top: float,
+    min_conf: float,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+) -> list[dict]:
     from paddleocr import PaddleOCR
 
     cap = cv2.VideoCapture(video_path)
@@ -65,44 +81,60 @@ def extract_hard_subtitles(video_path: str, interval: float, fast_interval: floa
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
     duration = frame_count / fps if fps > 0 else 0
+    start_time = max(0.0, float(start_time or 0.0))
+    end_time = min(duration, float(end_time)) if end_time is not None else duration
+    start_frame = max(0, int(round(start_time * fps)))
+    end_frame = min(int(frame_count) - 1, int(round(end_time * fps))) if frame_count else int(round(end_time * fps))
     fast_step = max(1, int(round(fps * fast_interval)))
     fine_step = max(1, int(round(fps * interval)))
 
-    ocr = PaddleOCR(
-        lang="ch",
-        ocr_version="PP-OCRv4",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        text_det_limit_side_len=960,
-    )
-    active_windows = _scan_active_windows(cap, ocr, fps, frame_count, fast_step, crop_top, min_conf)
+    ocr = _create_paddleocr(PaddleOCR)
+    active_windows = _scan_active_windows(cap, ocr, fps, start_frame, end_frame, fast_step, crop_top, min_conf)
     samples = []
     for start_frame, end_frame in active_windows:
-        frame_index = start_frame
-        while frame_index <= end_frame:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = cap.read()
-            if not ok:
-                break
-            timestamp = frame_index / fps
-            text, confidence = _read_subtitle_region(ocr, frame, crop_top)
-            if text and confidence >= min_conf:
-                samples.append({"time": timestamp, "text": text, "confidence": confidence})
-            frame_index += fine_step
+        samples.extend(
+            _sample_window_sequential(
+                cap,
+                ocr,
+                fps,
+                start_frame,
+                end_frame,
+                fine_step,
+                crop_top,
+                min_conf,
+            )
+        )
 
     cap.release()
     samples = _filter_persistent_text_samples(samples)
     segments = _merge_samples(samples, max_gap=interval * 2.5, sample_interval=interval)
-    segments = _filter_noisy_segments(segments)
-    return _dedupe_adjacent_segments(segments)
+    return _postprocess_segments(segments)
 
 
-def _scan_active_windows(cap, ocr, fps: float, frame_count: float, step: int, crop_top: float, min_conf: float) -> list[tuple[int, int]]:
+def _create_paddleocr(paddleocr_cls):
+    kwargs = {
+        "lang": "ch",
+        "ocr_version": "PP-OCRv4",
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "text_det_limit_side_len": 960,
+        "enable_mkldnn": False,
+    }
+    try:
+        return paddleocr_cls(**kwargs)
+    except TypeError as exc:
+        if "enable_mkldnn" not in str(exc):
+            raise
+        kwargs.pop("enable_mkldnn", None)
+        return paddleocr_cls(**kwargs)
+
+
+def _scan_active_windows(cap, ocr, fps: float, start_frame: int, end_frame: int, step: int, crop_top: float, min_conf: float) -> list[tuple[int, int]]:
     windows = []
     current_start = None
-    frame_index = 0
-    while True:
+    frame_index = start_frame
+    while frame_index <= end_frame:
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ok, frame = cap.read()
         if not ok:
@@ -110,16 +142,30 @@ def _scan_active_windows(cap, ocr, fps: float, frame_count: float, step: int, cr
         text, confidence = _read_subtitle_region(ocr, frame, crop_top)
         if text and confidence >= min_conf:
             if current_start is None:
-                current_start = max(0, frame_index - step)
+                current_start = max(start_frame, frame_index - step)
         elif current_start is not None:
-            windows.append((current_start, min(int(frame_count), frame_index + step)))
+            windows.append((current_start, min(end_frame, frame_index + step)))
             current_start = None
         frame_index += step
-        if frame_count and frame_index > frame_count:
-            break
     if current_start is not None:
-        windows.append((current_start, int(frame_count)))
+        windows.append((current_start, end_frame))
     return _merge_windows(windows, max_gap=step * 2)
+
+
+def _sample_window_sequential(cap, ocr, fps: float, start_frame: int, end_frame: int, step: int, crop_top: float, min_conf: float) -> list[dict]:
+    samples = []
+    frame_index = start_frame
+    while frame_index <= end_frame:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        timestamp = frame_index / fps
+        text, confidence = _read_subtitle_region(ocr, frame, crop_top)
+        if text and confidence >= min_conf:
+            samples.append({"time": timestamp, "text": text, "confidence": confidence})
+        frame_index += step
+    return samples
 
 
 def _merge_windows(windows: list[tuple[int, int]], max_gap: int) -> list[tuple[int, int]]:
@@ -348,10 +394,14 @@ def _cluster_is_persistent(cluster: list[dict], min_count: int, min_span: float)
 
 def _filter_noisy_segments(segments: list[dict]) -> list[dict]:
     noisy_indexes = set()
+    seed_indexes = set()
     for index, segment in enumerate(segments):
         if _is_noisy_segment(segment):
             noisy_indexes.add(index)
-    noisy_indexes.update(_find_noisy_similarity_cluster_indexes(segments, noisy_indexes))
+            seed_indexes.add(index)
+        elif _is_noise_cluster_seed(segment):
+            seed_indexes.add(index)
+    noisy_indexes.update(_find_noisy_similarity_cluster_indexes(segments, seed_indexes))
 
     filtered = []
     for index, segment in enumerate(segments):
@@ -359,6 +409,12 @@ def _filter_noisy_segments(segments: list[dict]) -> list[dict]:
             continue
         filtered.append(segment)
     return filtered
+
+
+def _postprocess_segments(segments: list[dict]) -> list[dict]:
+    segments = sorted(segments, key=lambda item: float(item.get("start", 0.0)))
+    segments = _filter_noisy_segments(segments)
+    return _dedupe_adjacent_segments(segments)
 
 
 def _dedupe_adjacent_segments(
@@ -417,11 +473,8 @@ def _is_noisy_segment(segment: dict) -> bool:
     if not text:
         return True
     chinese_count = sum("\u4e00" <= char <= "\u9fff" for char in text)
-    ascii_noise_count = sum(char.isascii() and (char.isalnum() or not char.isspace()) for char in text)
     latin_digit_count = sum(char.isascii() and char.isalnum() for char in text)
-    if chinese_count >= 2 and latin_digit_count >= 2:
-        return True
-    if ascii_noise_count and ascii_noise_count >= max(2, chinese_count):
+    if chinese_count == 0 and latin_digit_count:
         return True
     if any(char in text for char in "&@#$%^*_+=<>\\|~"):
         return True
@@ -430,6 +483,13 @@ def _is_noisy_segment(segment: dict) -> bool:
     if duration < 0.35 and len(text) <= 3 and confidence < 0.99:
         return True
     return False
+
+
+def _is_noise_cluster_seed(segment: dict) -> bool:
+    text = str(segment.get("text", ""))
+    chinese_count = sum("\u4e00" <= char <= "\u9fff" for char in text)
+    latin_digit_count = sum(char.isascii() and char.isalnum() for char in text)
+    return chinese_count >= 2 and latin_digit_count >= 2
 
 
 def _find_noisy_similarity_cluster_indexes(

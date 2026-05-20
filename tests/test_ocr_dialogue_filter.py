@@ -1,4 +1,4 @@
-from ocr_subtitle_probe import _choose_dialogue_text, _dedupe_adjacent_segments, _filter_noisy_segments, _filter_persistent_text_samples
+from ocr_subtitle_probe import _choose_dialogue_text, _create_paddleocr, _dedupe_adjacent_segments, _filter_noisy_segments, _filter_persistent_text_samples
 from ocr_subtitle_probe import _first_nonempty_boxes
 
 
@@ -168,3 +168,30 @@ def test_ocr_dedupes_adjacent_rotated_subtitle_segments():
     assert deduped[0]["text"] == "哇！我直接变身熔岩巨鲨"
     assert deduped[0]["start"] == 27.33
     assert deduped[0]["end"] == 30.33
+
+
+def test_paddleocr_init_disables_mkldnn():
+    calls = []
+
+    class FakePaddleOCR:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    _create_paddleocr(FakePaddleOCR)
+
+    assert calls[0]["enable_mkldnn"] is False
+
+
+def test_paddleocr_init_retries_when_enable_mkldnn_is_unsupported():
+    calls = []
+
+    class FakePaddleOCR:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            if "enable_mkldnn" in kwargs:
+                raise TypeError("unexpected keyword argument 'enable_mkldnn'")
+
+    _create_paddleocr(FakePaddleOCR)
+
+    assert "enable_mkldnn" in calls[0]
+    assert "enable_mkldnn" not in calls[1]
