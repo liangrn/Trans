@@ -272,6 +272,8 @@ def _merge_adjacent_ocr_duplicates(
         )
         index += merged_count
 
+    cleaned, noise_report = _filter_low_confidence_ocr_noise(cleaned)
+    report.extend(noise_report)
     return cleaned, report
 
 
@@ -279,6 +281,10 @@ def _try_merge_ocr_duplicate_group(group: list[dict]) -> tuple[dict, str] | None
     texts = [str(item.get("text", "")).strip() for item in group]
     if len(texts) < 2 or any(_chinese_count(text) < 2 for text in texts):
         return None
+
+    confident_longer_variant = _choose_confident_longer_variant_pair(group)
+    if confident_longer_variant:
+        return _build_merged_ocr_segment(group, confident_longer_variant), "confident_longer_variant_pair"
 
     short_completion = _choose_short_completion(group)
     if short_completion:
@@ -335,14 +341,46 @@ def _choose_noisy_long_to_clean_short(group: list[dict]) -> str | None:
     shorter, longer = (first, second) if len(first) < len(second) else (second, first)
     short_segment = group[0] if first == shorter else group[1]
     long_segment = group[0] if first == longer else group[1]
-    if _chinese_count(shorter) < 4 or not longer.startswith(shorter):
+    short_conf = float(short_segment.get("confidence", 0.0))
+    long_conf = float(long_segment.get("confidence", 0.0))
+    min_clean_length = 3 if long_conf < 0.9 and short_conf >= 0.95 else 4
+    if _chinese_count(shorter) < min_clean_length or not longer.startswith(shorter):
         return None
     suffix = longer[len(shorter):]
     if _chinese_count(suffix) < 3:
         return None
-    if float(long_segment.get("confidence", 0.0)) > float(short_segment.get("confidence", 0.0)) - 0.12:
+    if long_conf > short_conf - 0.12:
         return None
     return shorter
+
+
+def _choose_confident_longer_variant_pair(group: list[dict]) -> str | None:
+    if len(group) != 2:
+        return None
+    first = str(group[0].get("text", "")).strip()
+    second = str(group[1].get("text", "")).strip()
+    if abs(len(first) - len(second)) > 1:
+        return None
+    if _chinese_count(first) < 4 or _chinese_count(second) < 4:
+        return None
+    if SequenceMatcher(None, first, second).ratio() < 0.78:
+        return None
+
+    first_conf = float(group[0].get("confidence", 0.0))
+    second_conf = float(group[1].get("confidence", 0.0))
+    if max(first_conf, second_conf) < 0.90 or min(first_conf, second_conf) >= 0.90:
+        return None
+
+    first_duration = float(group[0].get("end", 0.0)) - float(group[0].get("start", 0.0))
+    second_duration = float(group[1].get("end", 0.0)) - float(group[1].get("start", 0.0))
+    if max(first_duration, second_duration) < 0.8:
+        return None
+    if abs(first_duration - second_duration) < 0.45:
+        return None
+
+    first_score = (first_conf, first_duration, len(first))
+    second_score = (second_conf, second_duration, len(second))
+    return first if first_score >= second_score else second
 
 
 def _choose_prefix_to_clean_long(group: list[dict]) -> str | None:
@@ -501,6 +539,101 @@ def _build_merged_ocr_segment(group: list[dict], text: str) -> dict:
         "confidence": confidence,
         "source": "ocr",
     }
+
+
+def _filter_low_confidence_ocr_noise(segments: list[dict]) -> tuple[list[dict], list[dict]]:
+    cleaned = []
+    report = []
+    for index, segment in enumerate(segments):
+        if _is_low_confidence_ocr_noise(segments, index):
+            report.append(
+                {
+                    "reason": "low_confidence_noise",
+                    "original": [dict(segment)],
+                    "removed": dict(segment),
+                }
+            )
+            continue
+        cleaned.append(segment)
+    return cleaned, report
+
+
+def _is_low_confidence_ocr_noise(segments: list[dict], index: int) -> bool:
+    segment = segments[index]
+    if segment.get("source") != "ocr":
+        return False
+
+    text = str(segment.get("text", "")).strip()
+    confidence = float(segment.get("confidence", 0.0))
+    if confidence >= 0.90 or _chinese_count(text) < 2:
+        return False
+    if _has_adjacent_ocr_text_support(segments, index):
+        return False
+    if _has_low_confidence_duplicate_neighbor(segments, index):
+        return True
+
+    duration = float(segment.get("end", 0.0)) - float(segment.get("start", 0.0))
+    chinese_chars = _chinese_count(text)
+
+    if confidence < 0.65:
+        return duration <= 0.55 or chinese_chars <= 6
+    return duration <= 0.55 and chinese_chars >= 4
+
+
+def _has_adjacent_ocr_text_support(segments: list[dict], index: int) -> bool:
+    text = str(segments[index].get("text", "")).strip()
+    start = float(segments[index].get("start", 0.0))
+    end = float(segments[index].get("end", start))
+    for neighbor_index in (index - 1, index + 1):
+        if neighbor_index < 0 or neighbor_index >= len(segments):
+            continue
+        neighbor = segments[neighbor_index]
+        if neighbor.get("source") != "ocr":
+            continue
+        if float(neighbor.get("confidence", 0.0)) < 0.90:
+            continue
+        neighbor_text = str(neighbor.get("text", "")).strip()
+        if not neighbor_text:
+            continue
+        gap = (
+            start - float(neighbor.get("end", 0.0))
+            if neighbor_index < index
+            else float(neighbor.get("start", 0.0)) - end
+        )
+        if gap > 0.5:
+            continue
+        shorter, longer = (text, neighbor_text) if len(text) <= len(neighbor_text) else (neighbor_text, text)
+        if _chinese_count(shorter) >= 2 and shorter in longer:
+            return True
+        similarity = SequenceMatcher(None, text, neighbor_text).ratio()
+        if similarity >= 0.82:
+            return True
+        if abs(len(text) - len(neighbor_text)) <= 1 and similarity >= 0.72:
+            return True
+    return False
+
+
+def _has_low_confidence_duplicate_neighbor(segments: list[dict], index: int) -> bool:
+    text = str(segments[index].get("text", "")).strip()
+    start = float(segments[index].get("start", 0.0))
+    end = float(segments[index].get("end", start))
+    for neighbor_index in (index - 1, index + 1):
+        if neighbor_index < 0 or neighbor_index >= len(segments):
+            continue
+        neighbor = segments[neighbor_index]
+        if neighbor.get("source") != "ocr" or float(neighbor.get("confidence", 0.0)) >= 0.90:
+            continue
+        neighbor_text = str(neighbor.get("text", "")).strip()
+        if not neighbor_text or abs(len(text) - len(neighbor_text)) > 2:
+            continue
+        gap = (
+            start - float(neighbor.get("end", 0.0))
+            if neighbor_index < index
+            else float(neighbor.get("start", 0.0)) - end
+        )
+        if gap <= 0.5 and SequenceMatcher(None, text, neighbor_text).ratio() >= 0.72:
+            return True
+    return False
 
 
 def _common_prefix(texts: list[str]) -> str:

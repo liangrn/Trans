@@ -81,6 +81,20 @@ def test_does_not_merge_two_near_duplicates_without_majority():
     assert report == []
 
 
+def test_keeps_longer_higher_confidence_variant_when_short_low_confidence_duplicate_precedes_it():
+    segments = [
+        _seg("遭歹人陷害", 376.20, 376.53, 0.88),
+        _seg("遭列人陷害", 376.53, 378.20, 0.92),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["遭列人陷害"]
+    assert cleaned[0]["start"] == 376.20
+    assert cleaned[0]["end"] == 378.20
+    assert report[0]["reason"] == "confident_longer_variant_pair"
+
+
 def test_does_not_merge_repeated_text_far_apart():
     segments = [
         _seg("沈遇", 1.08, 1.73, 1.00),
@@ -149,3 +163,96 @@ def test_prefers_clean_long_sentence_over_noisy_prefix_variants():
     assert cleaned[0]["start"] == 149.56
     assert cleaned[0]["end"] == 150.89
     assert report[0]["reason"] == "prefix_to_clean_long"
+
+
+def test_filters_isolated_very_low_confidence_short_noise():
+    segments = [
+        _seg("从今天开始", 512.00, 512.70, 0.99),
+        _seg("智茄星牛面", 512.73, 513.06, 0.58),
+        _seg("我们好好过", 513.40, 514.20, 0.98),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["从今天开始", "我们好好过"]
+    assert report[0]["reason"] == "low_confidence_noise"
+    assert report[0]["removed"]["text"] == "智茄星牛面"
+
+
+def test_filters_mid_confidence_short_noise_with_no_context_support():
+    segments = [
+        _seg("从今天开始", 440.60, 441.30, 0.99),
+        _seg("热谢短剧", 441.40, 441.73, 0.76),
+        _seg("我们好好过", 442.20, 443.00, 0.98),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["从今天开始", "我们好好过"]
+    assert report[0]["reason"] == "low_confidence_noise"
+    assert report[0]["removed"]["text"] == "热谢短剧"
+
+
+def test_filters_low_confidence_neighbor_pair_without_high_confidence_support():
+    segments = [
+        _seg("那种东西", 439.07, 440.06, 1.00),
+        _seg("热谢短剧", 441.40, 441.73, 0.76),
+        _seg("热习短剧", 441.73, 442.40, 0.88),
+        _seg("我才不吃", 442.40, 443.40, 1.00),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["那种东西", "我才不吃"]
+    assert [item["removed"]["text"] for item in report] == ["热谢短剧", "热习短剧"]
+
+
+def test_keeps_short_low_confidence_dialogue():
+    segments = [
+        _seg("你先走吧", 44.20, 45.00, 0.99),
+        _seg("毕竟", 45.22, 45.89, 0.73),
+        _seg("这件事不简单", 46.30, 47.20, 0.98),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["你先走吧", "毕竟", "这件事不简单"]
+    assert report == []
+
+
+def test_keeps_low_confidence_text_with_high_confidence_neighbor_support():
+    segments = [
+        _seg("竞然有肉", 516.40, 516.73, 0.96),
+        _seg("竟然有肉", 516.73, 517.06, 0.89),
+        _seg("番茄鸡蛋牛肉面", 517.07, 518.06, 0.96),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["竞然有肉", "竟然有肉", "番茄鸡蛋牛肉面"]
+    assert report == []
+
+
+def test_keeps_long_low_confidence_text_without_duplicate_neighbor():
+    segments = [
+        _seg("相公", 562.07, 563.06, 1.00),
+        _seg("已经亥时了", 563.07, 564.40, 0.88),
+        _seg("该就寝了", 564.40, 565.40, 1.00),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["相公", "已经亥时了", "该就寝了"]
+    assert report == []
+
+
+def test_merges_short_clean_text_over_low_confidence_noisy_extension():
+    segments = [
+        _seg("好吃吧鸡牛电酒", 481.73, 482.06, 0.81),
+        _seg("好吃吧", 482.07, 482.73, 1.00),
+    ]
+
+    cleaned, report = _merge_adjacent_ocr_duplicates(segments)
+
+    assert [item["text"] for item in cleaned] == ["好吃吧"]
+    assert report[0]["reason"] == "noisy_long_to_clean_short"
