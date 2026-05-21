@@ -241,6 +241,8 @@ def get_voice_for_segment(
             alignment.get("smoothed_confidence", alignment.get("segment_confidence", 0.0))
         )
     speaker_default_voice = speaker_voice_map.get(best_speaker)
+    if speaker_default_voice and speaker_default_voice.startswith("clone_"):
+        return speaker_default_voice
     speaker_default_gender = _voice_key_gender(speaker_default_voice) if speaker_default_voice else "unknown"
     if (
         aligned_gender in ("male", "female")

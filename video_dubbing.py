@@ -130,6 +130,15 @@ def _resolve_ffmpeg_bin() -> str:
 
 FFMPEG_BIN = _resolve_ffmpeg_bin()
 
+XTTS_V2_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
+XTTS_REQUIRED_FILES = ("model.pth", "config.json", "vocab.json", "speakers_xtts.pth")
+XTTS_LANGUAGE_MAP = {
+    "en": "en", "ja": "ja", "ko": "ko", "zh": "zh-cn",
+    "es": "es", "fr": "fr", "de": "de", "it": "it",
+    "pt": "pt", "pl": "pl", "tr": "tr", "ru": "ru",
+    "nl": "nl", "ar": "ar", "hi": "hi",
+}
+
 # ===== 注入 FFMPEG_BIN 到 moviepy 1.x 配置 =====
 # moviepy 1.x 通过 moviepy.config.FFMPEG_BINARY 决定调用哪个 ffmpeg，
 # write_videofile 不接受 ffmpeg_exe 参数，必须在此处覆盖配置。
@@ -313,7 +322,7 @@ def get_available_coqui_voices():
     跨语言克隆英文 VCTK 前 5 男声/女声，保证多说话人配音有稳定
     的轮换音色。真实单语种 Coqui 模型保留为 native key，供手动选择。
     """
-    XTTS_V2 = "tts_models/multilingual/multi-dataset/xtts_v2"
+    XTTS_V2 = XTTS_V2_MODEL
 
     voices = {
         # ==================== 英语 (English) — tts_models/en/vctk/vits ====================
@@ -568,6 +577,7 @@ def _build_tts_cache_digest(seg_data, idx, speaker_idx, target_lang):
             "speaker_idx": speaker_idx,
             "model_name": seg_data.get("_tts_model_name"),
             "speaker_wav": seg_data.get("_speaker_wav"),
+            "speaker_wav_signature": _speaker_wav_signature(seg_data.get("_speaker_wav")),
             "tts_language": seg_data.get("_tts_language"),
             "voice_key": seg_data.get("_voice_key"),
             "text": text,
@@ -587,13 +597,249 @@ def _is_valid_cached_tts_file(path):
         return False
 
 
+def _get_xtts_language(target_lang):
+    base_lang = (target_lang or "en").lower().split("-")[0].split("_")[0]
+    return XTTS_LANGUAGE_MAP.get(base_lang, base_lang)
+
+
+def _get_xtts_model_dir():
+    try:
+        from trainer.io import get_user_data_dir
+        base_dir = Path(get_user_data_dir("tts"))
+    except Exception:
+        if sys.platform == "darwin":
+            base_dir = Path.home() / "Library" / "Application Support" / "tts"
+        elif os.name == "nt":
+            base_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "tts"
+        else:
+            base_dir = Path.home() / ".local" / "share" / "tts"
+    return base_dir / "tts_models--multilingual--multi-dataset--xtts_v2"
+
+
+def _is_xtts_v2_downloaded():
+    model_dir = _get_xtts_model_dir()
+    return model_dir.exists() and all((model_dir / name).is_file() for name in XTTS_REQUIRED_FILES)
+
+
+def _speaker_wav_signature(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        stat = os.stat(path)
+        return {
+            "path": os.path.abspath(path),
+            "size": stat.st_size,
+            "mtime_ns": getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)),
+        }
+    except OSError:
+        return {"path": os.path.abspath(path)}
+
+
+def _wav_rms(path):
+    import wave
+
+    try:
+        with wave.open(str(path), "rb") as wav_file:
+            frames = wav_file.readframes(wav_file.getnframes())
+            sample_width = wav_file.getsampwidth()
+        if not frames:
+            return 0.0
+        if sample_width == 2:
+            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sample_width == 4:
+            data = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            data = np.frombuffer(frames, dtype=np.uint8).astype(np.float32)
+            data = (data - 128.0) / 128.0
+        if data.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(data))))
+    except Exception:
+        return 0.0
+
+
+def _is_valid_speaker_reference(path, min_duration=2.5, min_rms=0.001):
+    try:
+        if not path or not os.path.exists(path) or os.path.getsize(path) <= 512:
+            return False
+        return _probe_audio_duration(str(path)) >= min_duration and _wav_rms(path) >= min_rms
+    except Exception:
+        return False
+
+
+def _speaker_reference_sources(dialogue_path):
+    dialogue = Path(dialogue_path) if dialogue_path else None
+    audio_dir = dialogue.parent if dialogue else None
+    sources = []
+    if audio_dir:
+        separator_dir = audio_dir / "_work" / "separator_output"
+        if separator_dir.exists():
+            for path in sorted(separator_dir.glob("*Vocals*.wav")):
+                sources.append(("source_vocals", path))
+        sources.append(("work_vocals", audio_dir / "_work" / "vocals.wav"))
+    if dialogue:
+        sources.append(("dialogue", dialogue))
+
+    seen = set()
+    unique_sources = []
+    for label, path in sources:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_sources.append((label, path))
+    return unique_sources
+
+
+def _write_speaker_reference_from_source(source_path, speaker_info, output_path):
+    if not source_path or not os.path.exists(source_path):
+        return False, "源文件不存在"
+
+    source_duration = _probe_audio_duration(str(source_path))
+    if source_duration <= 0.1:
+        return False, "源文件时长异常"
+
+    segments = speaker_info.get("segments", [])
+    if not segments:
+        return False, "无 speaker 片段"
+
+    audio = None
+    try:
+        audio = AudioFileClip(str(source_path))
+        audio_duration = max(0.0, float(audio.duration or source_duration))
+        candidates = []
+        for raw_start, raw_end in segments:
+            start = max(0.0, min(float(raw_start), max(0.0, audio_duration - 0.05)))
+            end = max(start + 0.05, min(float(raw_end), max(0.05, audio_duration - 0.02)))
+            duration = end - start
+            if duration >= 0.45:
+                candidates.append((start, end, duration))
+        if not candidates:
+            return False, "无有效裁剪片段"
+
+        candidates.sort(key=lambda item: item[2], reverse=True)
+        clips = []
+        total_duration = 0.0
+        try:
+            for start, end, duration in candidates:
+                clips.append(audio.subclip(start, end))
+                total_duration += duration
+                if total_duration >= 10.0:
+                    break
+            if total_duration < 2.5:
+                return False, f"参考音频过短: {total_duration:.2f}s"
+            if len(clips) == 1:
+                clips[0].write_audiofile(str(output_path), fps=22050, nbytes=2, codec="pcm_s16le", verbose=False, logger=None)
+            else:
+                from moviepy.editor import concatenate_audioclips
+                combined = concatenate_audioclips(clips)
+                combined.write_audiofile(str(output_path), fps=22050, nbytes=2, codec="pcm_s16le", verbose=False, logger=None)
+                combined.close()
+        finally:
+            for clip in clips:
+                clip.close()
+
+        if not _is_valid_speaker_reference(output_path):
+            _safe_remove(str(output_path))
+            return False, "参考音频无效或接近静音"
+        return True, "created"
+    except Exception as e:
+        _safe_remove(str(output_path))
+        return False, str(e)
+    finally:
+        if audio is not None:
+            audio.close()
+
+
+def _build_speaker_reference_audio(dialogue_path, speaker_id, speaker_info, refs_dir):
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = refs_dir / f"{speaker_id}.wav"
+    if _is_valid_speaker_reference(output_path):
+        return str(output_path), {
+            "status": "cached",
+            "source": "cached",
+            "duration": _probe_audio_duration(str(output_path)),
+            "rms": _wav_rms(output_path),
+        }
+
+    failures = []
+    for source_label, source_path in _speaker_reference_sources(dialogue_path):
+        success, status = _write_speaker_reference_from_source(source_path, speaker_info, output_path)
+        if success:
+            return str(output_path), {
+                "status": status,
+                "source": source_label,
+                "source_path": str(source_path),
+                "duration": _probe_audio_duration(str(output_path)),
+                "rms": _wav_rms(output_path),
+            }
+        failures.append(f"{source_label}: {status}")
+    return None, {
+        "status": "failed",
+        "source": None,
+        "reason": "; ".join(failures) if failures else "无可用参考音频源",
+    }
+
+
+def _build_speaker_clone_voices(pipeline_run, dialogue_path, speaker_map, target_lang):
+    if not speaker_map:
+        return {}, {}
+    if not _is_xtts_v2_downloaded():
+        print("  [Speaker Clone] XTTS-v2 未完整下载，跳过原视频音色克隆，使用原有声音分配")
+        return {}, {}
+
+    refs_dir = pipeline_run.stage_dir("tts") / "speaker_refs"
+    xtts_language = _get_xtts_language(target_lang)
+    clone_voices = {}
+    clone_voice_map = {}
+    manifest = {}
+    print("  [Speaker Clone] 构建原视频说话人参考音频...")
+    for speaker_id, info in sorted(speaker_map.items()):
+        ref_path, ref_info = _build_speaker_reference_audio(dialogue_path, speaker_id, info, refs_dir)
+        manifest[speaker_id] = ref_info
+        if not ref_path:
+            print(f"    {speaker_id}: 跳过 ({ref_info.get('reason') or ref_info.get('status')})")
+            continue
+        voice_key = f"clone_{speaker_id}"
+        clone_voices[voice_key] = {
+            "model_name": XTTS_V2_MODEL,
+            "language": xtts_language,
+            "speaker_wav": ref_path,
+            "requires_speaker_wav": True,
+            "description": f"XTTS-v2 clone from original video speaker {speaker_id}",
+        }
+        clone_voice_map[speaker_id] = voice_key
+        print(
+            f"    {speaker_id}: {ref_info.get('status')} "
+            f"from {ref_info.get('source')} -> {ref_path}"
+        )
+    try:
+        manifest_path = refs_dir / "speaker_refs_manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [Speaker Clone] 写入参考音频 manifest 失败: {e}")
+    return clone_voices, clone_voice_map
+
+
+def _load_reference_tts_model(voice_config):
+    model_name = voice_config.get("model_name")
+    speaker_idx = voice_config.get("speaker_idx")
+    print(f"  - 加载参考声音模型: {model_name}")
+    tts = TTS(model_name=model_name, progress_bar=True, gpu=False)
+    tts._xtts_language = None
+    tts._model_name = model_name
+    tts._speaker_wav = None
+    return tts, speaker_idx
+
+
 def _get_or_create_xtts_reference_wav(reference_voice_key):
     """为 XTTS 跨语言克隆生成英文 VCTK 参考音频缓存。"""
     voices = get_available_coqui_voices()
     reference_config = voices.get(reference_voice_key)
     if not reference_config:
         raise ValueError(f"reference_voice_key 不存在: {reference_voice_key}")
-    if reference_config.get("model_name") == "tts_models/multilingual/multi-dataset/xtts_v2":
+    if reference_config.get("model_name") == XTTS_V2_MODEL:
         raise ValueError(f"reference_voice_key 不能指向 XTTS 克隆声音: {reference_voice_key}")
 
     cache_dir = Path(__file__).resolve().parent / "pretrained_models" / "xtts_voice_refs"
@@ -605,7 +851,7 @@ def _get_or_create_xtts_reference_wav(reference_voice_key):
     print(f"  - 生成 XTTS 参考音频: {reference_voice_key}")
     ref_tts = None
     try:
-        ref_tts, ref_speaker_idx = load_coqui_tts_model(reference_config, gpu_is_available=False)
+        ref_tts, ref_speaker_idx = _load_reference_tts_model(reference_config)
         synthesize_speech_coqui_single(
             ref_tts,
             ref_speaker_idx,
@@ -637,13 +883,17 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
     xtts_language = voice_config.get("language", None)
     speaker_wav = voice_config.get("speaker_wav")
     reference_voice_key = voice_config.get("reference_voice_key")
+    requires_speaker_wav = bool(voice_config.get("requires_speaker_wav"))
 
     print(f"  - 加载TTS模型: {model_name}")
     if xtts_language:
         print(f"    语言参数: {xtts_language}")
     if reference_voice_key:
         speaker_wav = _get_or_create_xtts_reference_wav(reference_voice_key)
+        requires_speaker_wav = True
         print(f"    参考音色: {reference_voice_key}")
+    if model_name == XTTS_V2_MODEL and requires_speaker_wav and not (speaker_wav and os.path.isfile(speaker_wav)):
+        raise RuntimeError("XTTS 克隆声音缺少有效 speaker_wav")
 
     try:
         tts = TTS(model_name=model_name, progress_bar=True, gpu=False)
@@ -651,11 +901,16 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
         tts._xtts_language = xtts_language
         tts._model_name = model_name
         tts._speaker_wav = speaker_wav
+        tts._requires_speaker_wav = requires_speaker_wav
         return tts, speaker_idx
     except Exception as e:
         # 明确警告：不再静默，避免用户不知情地收到英语配音
         print(f"  ⚠ [警告] TTS 模型加载失败: {model_name}")
         print(f"    错误详情: {e}")
+        if model_name == XTTS_V2_MODEL and requires_speaker_wav:
+            raise RuntimeError(
+                f"XTTS 克隆模型加载失败，不能降级为非克隆声音。\n原始错误: {e}"
+            ) from e
         if model_name == FALLBACK_MODEL:
             # 基准模型本身也失败，无法继续
             raise RuntimeError(
@@ -669,6 +924,7 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
             tts._xtts_language = None
             tts._model_name = FALLBACK_MODEL
             tts._speaker_wav = None
+            tts._requires_speaker_wav = False
             tts._is_fallback = True  # 标记为降级，供上层判断
             return tts, None
         except Exception as e2:
@@ -725,8 +981,16 @@ def synthesize_speech_coqui_single(tts_instance, speaker_idx, text, output_file,
                 if speaker_wav and os.path.isfile(speaker_wav):
                     tts_instance.tts_to_file(
                         text=text, file_path=output_file,
-                        language=xtts_language, speaker_wav=speaker_wav
+                        language=xtts_language, speaker_wav=speaker_wav,
+                        split_sentences=False,
+                        temperature=0.6,
+                        top_p=0.8,
+                        top_k=40,
+                        repetition_penalty=8.0,
+                        speed=1.08,
                     )
+                elif getattr(tts_instance, '_requires_speaker_wav', False):
+                    raise RuntimeError("XTTS 克隆声音缺少有效 speaker_wav，拒绝使用默认 speaker")
                 else:
                     tts_instance.tts_to_file(
                         text=text, file_path=output_file,
@@ -1314,6 +1578,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             })
 
         # ===== 分配说话人声音 =====
+        runtime_available_voices = available_voices
         if SPEAKER_AWARE_AVAILABLE and speaker_map:
             print('\n[3/6] 分配说话人声音...')
             speaker_map = enrich_speaker_map_with_subtitle_genders(
@@ -1324,18 +1589,34 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             speaker_voice_map = build_speaker_voice_map(
                 speaker_map, target_language, available_voices, selected_voice_key
             )
+            clone_voices, clone_voice_map = _build_speaker_clone_voices(
+                pipeline_run,
+                asr_audio_path,
+                speaker_map,
+                target_language,
+            )
+            if clone_voices:
+                runtime_available_voices = dict(available_voices)
+                runtime_available_voices.update(clone_voices)
+                speaker_voice_map.update(clone_voice_map)
+                print(f"  [Speaker Clone] 启用 {len(clone_voices)} 个原视频克隆声音")
         # ==========================
 
         # Step 4: 加载TTS模型
         print("\n[4/6] 加载TTS模型...")
-        voice_config = available_voices.get(selected_voice_key,
+        voice_config = runtime_available_voices.get(selected_voice_key,
                                             {"model_name": "tts_models/en/ljspeech/vits"})
         
-        try:
-            tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_is_available=False)
-        except Exception as e:
-            print(f"  - TTS模型加载失败: {e}")
-            return False
+        tts_model = None
+        tts_speaker_idx = None
+        if not (SPEAKER_AWARE_AVAILABLE and speaker_map and speaker_voice_map):
+            try:
+                tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_is_available=False)
+            except Exception as e:
+                print(f"  - TTS模型加载失败: {e}")
+                return False
+        else:
+            print("  - 多说话人模式：按片段声音分组延迟加载 TTS 模型")
         
         # Step 5: 生成并调整TTS音频
         print("\n[5/6] 生成并调整配音音频...")
@@ -1350,14 +1631,14 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 seg['_voice_key'] = get_voice_for_segment(
                     seg['start'], seg['end'],
                     speaker_map, speaker_voice_map, selected_voice_key,
-                    available_voices=available_voices,
+                    available_voices=runtime_available_voices,
                     target_lang=target_language
                 )
                 voice_alignment_report.append(explain_segment_voice_alignment(
                     seg['start'], seg['end'],
                     seg.get('original_text') or seg.get('translated_text', ''),
                     speaker_map, speaker_voice_map, selected_voice_key,
-                    available_voices=available_voices,
+                    available_voices=runtime_available_voices,
                     target_lang=target_language,
                 ))
             print_voice_alignment_summary(voice_alignment_report, selected_voice_key)
@@ -1370,7 +1651,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             # 按 voice_key 分组，每组用自己的 TTS 模型生成
             tts_results, tts_temp_files = _generate_tts_multi_voice(
                 translated_segments_data, target_language,
-                available_voices, selected_voice_key,
+                runtime_available_voices, selected_voice_key,
                 False, max_workers=tts_workers,
                 cache_root=tts_cache_dir,
             )
@@ -1989,6 +2270,20 @@ def _generate_tts_multi_voice(
 
     results = [None] * len(segments_data)
     all_temp_files = []
+    model_cache = {}
+
+    def prepare_voice_config(voice_config):
+        prepared = dict(voice_config or {})
+        if prepared.get("reference_voice_key") and not prepared.get("speaker_wav"):
+            prepared["speaker_wav"] = _get_or_create_xtts_reference_wav(prepared["reference_voice_key"])
+            prepared["requires_speaker_wav"] = True
+        return prepared
+
+    def model_cache_key(voice_config):
+        return (
+            voice_config.get("model_name", "tts_models/en/ljspeech/vits"),
+            voice_config.get("language"),
+        )
 
     for voice_key in voice_keys:
         # 找到属于该声音的片段（保留原始 index）
@@ -1997,21 +2292,45 @@ def _generate_tts_multi_voice(
         if not group:
             continue
 
-        voice_config = available_voices.get(voice_key, available_voices.get(fallback_voice_key, {}))
+        voice_config = prepare_voice_config(
+            available_voices.get(voice_key, available_voices.get(fallback_voice_key, {}))
+        )
         print(f"\n  - 加载声音模型: {voice_key}")
         try:
-            tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_available)
+            cache_key = model_cache_key(voice_config)
+            if cache_key in model_cache:
+                tts_model = model_cache[cache_key]
+                tts_speaker_idx = voice_config.get("speaker_idx")
+                tts_model._xtts_language = voice_config.get("language")
+                tts_model._model_name = voice_config.get("model_name")
+                tts_model._speaker_wav = voice_config.get("speaker_wav")
+                tts_model._requires_speaker_wav = bool(voice_config.get("requires_speaker_wav"))
+                print("    - 复用已加载 TTS 模型")
+            else:
+                tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_available)
+                model_cache[cache_key] = tts_model
         except Exception as e:
             print(f"    - 模型加载失败: {e}，使用 fallback")
-            fallback_cfg = available_voices.get(fallback_voice_key, {})
-            tts_model, tts_speaker_idx = load_coqui_tts_model(fallback_cfg, gpu_available)
+            fallback_cfg = prepare_voice_config(available_voices.get(fallback_voice_key, {}))
+            fallback_key = model_cache_key(fallback_cfg)
+            if fallback_key in model_cache:
+                tts_model = model_cache[fallback_key]
+                tts_speaker_idx = fallback_cfg.get("speaker_idx")
+                tts_model._xtts_language = fallback_cfg.get("language")
+                tts_model._model_name = fallback_cfg.get("model_name")
+                tts_model._speaker_wav = fallback_cfg.get("speaker_wav")
+                tts_model._requires_speaker_wav = bool(fallback_cfg.get("requires_speaker_wav"))
+            else:
+                tts_model, tts_speaker_idx = load_coqui_tts_model(fallback_cfg, gpu_available)
+                model_cache[fallback_key] = tts_model
 
         # 只取该组的 seg_data 列表
         group_segs = [seg for _, seg in group]
         group_cache_dir = Path(cache_root) / voice_key if cache_root else None
+        group_workers = 1 if getattr(tts_model, "_xtts_language", None) else max_workers
         group_results, group_temps = generate_tts_parallel(
             group_segs, tts_model, tts_speaker_idx, target_lang,
-            max_workers=max_workers,
+            max_workers=group_workers,
             cache_dir=group_cache_dir,
         )
         all_temp_files.extend(group_temps)
@@ -2020,7 +2339,6 @@ def _generate_tts_multi_voice(
         for (orig_idx, _), res in zip(group, group_results):
             results[orig_idx] = res
 
-        del tts_model
         gc.collect()
 
     # 填补 None（不应发生，保险起见）
@@ -2028,6 +2346,10 @@ def _generate_tts_multi_voice(
         if r is None:
             results[i] = {"idx": i, "temp_tts_file": None,
                           "seg_data": segments_data[i], "success": False}
+
+    for tts_model in model_cache.values():
+        del tts_model
+    gc.collect()
 
     return results, all_temp_files
 
@@ -2045,8 +2367,8 @@ def main():
     parser.add_argument("--target_lang", help="目标语言代码 (单文件和多文件处理模式),例如：en, ja, ko, fr, pt, es, id, vi, tr, hi, ar, th, de, it")
     parser.add_argument("--voice", default="en_vctk_vits_m001", choices=available_voices.keys(),
                         help="选择配音声音")
-    parser.add_argument("--max_speed", type=float, default=1.35,
-                        help="最大语速加速倍数 (默认: 1.35，超过此值听感明显失真)")
+    parser.add_argument("--max_speed", type=float, default=1.5,
+                        help="最大语速加速倍数 (默认: 1.5，过高会影响清晰度)")
     parser.add_argument("--min_speed", type=float, default=1.0,
                         help="最小语速倍数 (默认: 1.0，TTS短于原始时长时原速播放不拉伸)")
     parser.add_argument("--merged_filename", default="merged_output.mp4",
