@@ -1419,6 +1419,16 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
     subtitle_clips = []
     temp_files_to_cleanup = []
     adjusted_tts_files = []
+    speaker_diarization_started = False
+
+    def _cleanup_background_speaker_task():
+        nonlocal speaker_diarization_started
+        if speaker_diarization_started and SPEAKER_AWARE_AVAILABLE:
+            try:
+                wait_diarization()
+            except Exception:
+                pass
+            speaker_diarization_started = False
     
     try:
         # 加载原视频
@@ -1503,6 +1513,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 )
                 if _hf_token and not speaker_stage_ready:
                     run_diarization_async(asr_audio_path, _hf_token)
+                    speaker_diarization_started = True
             # =========================================================
             
             original_segments_data = []
@@ -1539,16 +1550,16 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         gc.collect()
 
-        # ===== Step 2: 取说话人分离结果（ASR期间已后台运行）=====
+        # ===== Step 2: 说话人分离在后台运行，先执行翻译以重叠耗时 =====
         speaker_map = {}
         speaker_voice_map = {}
         if SPEAKER_AWARE_AVAILABLE:
-            print('\n[2/6] 获取说话人分离结果...')
+            print('\n[2/6] 说话人识别...')
             _hf_token = os.environ.get('HF_TOKEN', '')
-            if _hf_token:
-                speaker_map = get_or_create_speaker_gender_stage(pipeline_run, wait_diarization)
-                if not speaker_map:
-                    print('  [说话人识别] 后台结果为空，使用单一声音')
+            if _hf_token and speaker_diarization_started:
+                print('  [说话人识别] 已在后台运行，将与翻译并行')
+            elif _hf_token:
+                print('  [说话人识别] 将复用缓存或在翻译后获取结果')
             else:
                 print('  [跳过] 未设置 HF_TOKEN')
         # =============================================================
@@ -1566,6 +1577,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             )
         except Exception as e:
             print(f"  - 翻译失败，已停止后续 TTS/合成: {e}")
+            _cleanup_background_speaker_task()
             return False
         for result in translated_results:
             translated_segments_data.append({
@@ -1576,6 +1588,16 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 "start": result["start"],
                 "end": result["end"]
             })
+
+        # ===== 翻译完成后再获取说话人分离结果 =====
+        if SPEAKER_AWARE_AVAILABLE:
+            _hf_token = os.environ.get('HF_TOKEN', '')
+            if _hf_token:
+                print('\n[2/6] 获取说话人分离结果...')
+                speaker_map = get_or_create_speaker_gender_stage(pipeline_run, wait_diarization)
+                speaker_diarization_started = False
+                if not speaker_map:
+                    print('  [说话人识别] 结果为空，使用单一声音')
 
         # ===== 分配说话人声音 =====
         runtime_available_voices = available_voices
@@ -1879,6 +1901,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
     finally:
         # ========== 关键：确保所有资源都被释放 ==========
         print("\n- 清理资源...")
+        _cleanup_background_speaker_task()
         
         # 关闭所有音频片段
         for clip in final_audio_clips_for_composition:
