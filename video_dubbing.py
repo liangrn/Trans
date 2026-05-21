@@ -470,6 +470,7 @@ def generate_tts_parallel(segments_data, tts_model, speaker_idx, target_lang,
             seg_data.setdefault("_tts_model_name", getattr(tts_model, "_model_name", None))
             seg_data.setdefault("_speaker_wav", getattr(tts_model, "_speaker_wav", None))
             seg_data.setdefault("_tts_language", getattr(tts_model, "_xtts_language", None))
+            seg_data.setdefault("_tts_generation_profile", getattr(tts_model, "_tts_generation_profile", None))
             if cache_path:
                 cache_digest = _build_tts_cache_digest(seg_data, idx, speaker_idx, target_lang)
                 temp_tts_file = str(cache_path / _build_tts_cache_filename(seg_data, idx, speaker_idx, target_lang))
@@ -579,6 +580,7 @@ def _build_tts_cache_digest(seg_data, idx, speaker_idx, target_lang):
             "speaker_wav": seg_data.get("_speaker_wav"),
             "speaker_wav_signature": _speaker_wav_signature(seg_data.get("_speaker_wav")),
             "tts_language": seg_data.get("_tts_language"),
+            "tts_generation_profile": seg_data.get("_tts_generation_profile"),
             "voice_key": seg_data.get("_voice_key"),
             "text": text,
         },
@@ -902,6 +904,7 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
         tts._model_name = model_name
         tts._speaker_wav = speaker_wav
         tts._requires_speaker_wav = requires_speaker_wav
+        tts._tts_generation_profile = "xtts_clone_slightly_fast_v1" if speaker_wav else "default"
         return tts, speaker_idx
     except Exception as e:
         # 明确警告：不再静默，避免用户不知情地收到英语配音
@@ -925,6 +928,7 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
             tts._model_name = FALLBACK_MODEL
             tts._speaker_wav = None
             tts._requires_speaker_wav = False
+            tts._tts_generation_profile = "default"
             tts._is_fallback = True  # 标记为降级，供上层判断
             return tts, None
         except Exception as e2:
@@ -2328,6 +2332,9 @@ def _generate_tts_multi_voice(
                 tts_model._model_name = voice_config.get("model_name")
                 tts_model._speaker_wav = voice_config.get("speaker_wav")
                 tts_model._requires_speaker_wav = bool(voice_config.get("requires_speaker_wav"))
+                tts_model._tts_generation_profile = (
+                    "xtts_clone_slightly_fast_v1" if voice_config.get("speaker_wav") else "default"
+                )
                 print("    - 复用已加载 TTS 模型")
             else:
                 tts_model, tts_speaker_idx = load_coqui_tts_model(voice_config, gpu_available)
@@ -2343,6 +2350,9 @@ def _generate_tts_multi_voice(
                 tts_model._model_name = fallback_cfg.get("model_name")
                 tts_model._speaker_wav = fallback_cfg.get("speaker_wav")
                 tts_model._requires_speaker_wav = bool(fallback_cfg.get("requires_speaker_wav"))
+                tts_model._tts_generation_profile = (
+                    "xtts_clone_slightly_fast_v1" if fallback_cfg.get("speaker_wav") else "default"
+                )
             else:
                 tts_model, tts_speaker_idx = load_coqui_tts_model(fallback_cfg, gpu_available)
                 model_cache[fallback_key] = tts_model
