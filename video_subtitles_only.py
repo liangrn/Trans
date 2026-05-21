@@ -836,12 +836,16 @@ def process_single_video(input_video_path, target_language, output_video_path, p
             if i + 1 < len(original_segments_data):
                 next_starts[i] = original_segments_data[i + 1]["start"]
 
-        translated_results = get_or_create_translation_stage(
-            pipeline_run,
-            original_segments_data,
-            target_language,
-            max_workers=workers if parallel else 1,
-        )
+        try:
+            translated_results = get_or_create_translation_stage(
+                pipeline_run,
+                original_segments_data,
+                target_language,
+                max_workers=workers if parallel else 1,
+            )
+        except Exception as e:
+            print(f" - 翻译失败，已停止字幕合成: {e}")
+            return False
         sorted_results = sorted(translated_results, key=lambda r: r["idx"])
 
         for i, result in enumerate(sorted_results):

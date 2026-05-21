@@ -1293,12 +1293,16 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         print(f"\n[3/6] 翻译为 {target_language}...")
         translated_segments_data = []
 
-        translated_results = get_or_create_translation_stage(
-            pipeline_run,
-            original_segments_data,
-            target_language,
-            max_workers=workers if parallel else 1,
-        )
+        try:
+            translated_results = get_or_create_translation_stage(
+                pipeline_run,
+                original_segments_data,
+                target_language,
+                max_workers=workers if parallel else 1,
+            )
+        except Exception as e:
+            print(f"  - 翻译失败，已停止后续 TTS/合成: {e}")
+            return False
         for result in translated_results:
             translated_segments_data.append({
                 "idx": result.get("idx"),

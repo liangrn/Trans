@@ -138,6 +138,10 @@ def get_or_create_translation_stage(
     target_language: str,
     translator=translate_text_with_google,
     max_workers: int = 4,
+    max_retries: int = 5,
+    retry_base_delay: float = 1.0,
+    recovery_rounds: int = 3,
+    recovery_delays: tuple[float, ...] = (30.0, 90.0, 180.0),
 ) -> list[dict]:
     stage_dir = run.stage_dir("translation")
     translated_path = stage_dir / "translated_segments.json"
@@ -159,10 +163,16 @@ def get_or_create_translation_stage(
         stage_dir=stage_dir,
         translator=translator,
         max_workers=max_workers,
+        max_retries=max_retries,
+        retry_base_delay=retry_base_delay,
+        recovery_rounds=recovery_rounds,
+        recovery_delays=recovery_delays,
     )
     valid, reason = validate_translation_stage(translated_path, text_path, pending_path, segments)
     if not valid:
-        print(f"  - 翻译阶段仍有问题，流程继续: {reason}")
+        print(f"  - 翻译阶段仍有问题: {reason}")
+        print("  - 停止：不会进入 TTS，避免生成错误配音")
+        raise RuntimeError(f"翻译阶段未完成: {reason}")
     mark_stage_complete(
         run,
         "translation",

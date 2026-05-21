@@ -54,7 +54,9 @@ def translate_segments_with_cache(
     translator: Translator,
     max_workers: int = 4,
     max_retries: int = 5,
-    retry_base_delay: float = 0.8,
+    retry_base_delay: float = 1.0,
+    recovery_rounds: int = 0,
+    recovery_delays: tuple[float, ...] = (),
 ) -> list[dict]:
     stage_dir = Path(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -113,12 +115,75 @@ def translate_segments_with_cache(
                 "error": str(exc),
             }
 
-    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 4))) as executor:
-        futures = [executor.submit(work, item) for item in enumerate(segments)]
-        for future in as_completed(futures):
-            idx, result = future.result()
-            results[idx] = result
+    def run_pass(indexes: list[int]) -> None:
+        if not indexes:
+            return
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 4))) as executor:
+            futures = [executor.submit(work, (idx, segments[idx])) for idx in indexes]
+            for future in as_completed(futures):
+                idx, result = future.result()
+                results[idx] = result
 
+    run_pass(list(range(len(segments))))
+    final_results, pending = _write_translation_outputs(
+        results,
+        target_lang,
+        cache,
+        cache_path,
+        pending_path,
+        report_path,
+        segments_path,
+        text_path,
+        max_retries,
+        recovery_round=0,
+    )
+
+    for round_index in range(1, max(0, recovery_rounds) + 1):
+        if not pending:
+            break
+        delay = recovery_delays[round_index - 1] if round_index - 1 < len(recovery_delays) else 0.0
+        print(
+            f"  - 翻译仍有 {len(pending)} 句失败，"
+            f"{delay:.0f} 秒后自动回补第 {round_index}/{recovery_rounds} 轮..."
+        )
+        if delay > 0:
+            time.sleep(delay)
+
+        run_pass([int(item["idx"]) for item in pending])
+        final_results, pending = _write_translation_outputs(
+            results,
+            target_lang,
+            cache,
+            cache_path,
+            pending_path,
+            report_path,
+            segments_path,
+            text_path,
+            max_retries,
+            recovery_round=round_index,
+        )
+
+    if pending:
+        print(f"  - 翻译仍有 {len(pending)} 句失败，已达到自动回补上限")
+        print("  - 已保存 pending，下次重跑同一命令会继续回补")
+    elif recovery_rounds > 0:
+        print("  - 翻译回补完成，所有句子已成功翻译")
+
+    return final_results
+
+
+def _write_translation_outputs(
+    results: list[dict | None],
+    target_lang: str,
+    cache: dict,
+    cache_path: Path,
+    pending_path: Path,
+    report_path: Path,
+    segments_path: Path,
+    text_path: Path,
+    max_retries: int,
+    recovery_round: int,
+) -> tuple[list[dict], list[dict]]:
     final_results = [result for result in results if result is not None]
     pending = [
         {
@@ -138,6 +203,7 @@ def translate_segments_with_cache(
         "success": len(final_results) - len(pending),
         "failed": len(pending),
         "has_pending": bool(pending),
+        "recovery_round": recovery_round,
     }
     lines = [
         f"[{item['start']:.2f}-{item['end']:.2f}] {item['text']} -> {item['translated']}"
@@ -148,7 +214,7 @@ def translate_segments_with_cache(
     atomic_write_json(report_path, report)
     atomic_write_json(segments_path, final_results)
     _atomic_write_text(text_path, "\n".join(lines))
-    return final_results
+    return final_results, pending
 
 
 def _translate_with_retries(
