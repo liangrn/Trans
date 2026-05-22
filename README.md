@@ -232,6 +232,7 @@ python video_dubbing.py ^
 | `--parallel` | | `true` | 并行翻译开关，设为 `false` 禁用 |
 | `--workers` | | `10` | 翻译并行线程数，推荐 5~20 |
 | `--tts_workers` | | `3` | TTS 并行线程数，CPU 模式推荐 2~3 |
+| `--clone_voice` | | `true` | 是否启用原视频 speaker clone，设为 `false` 完全关闭 |
 | `--ffmpeg_bin` | | 自动 | 自定义 ffmpeg 可执行路径 |
 | `--font_path` | | 自动 | 自定义字幕字体文件路径（.ttf / .ttc） |
 
@@ -394,6 +395,8 @@ voice-gender-classifier/
 ## XTTS-v2 音色克隆
 
 XTTS-v2 支持声音克隆：提供一段 **3~6 秒** 的参考音频，输出音色会贴近该说话人。
+
+当前版本里，视频内原 speaker clone 会优先从 `source_(Vocals)` 中按同 gender、高置信字幕片段采样；证据不足时会直接回退到默认男/女 voice。若你想完全禁用这一路 clone，可在 `video_dubbing.py` 里使用 `--clone_voice false`。
 
 **使用方式：** 在 `get_available_coqui_voices()` 中为对应的声音条目添加 `speaker_wav` 字段，指向参考音频文件路径。
 

@@ -1,4 +1,23 @@
 from pathlib import Path
+import math
+import struct
+import wave
+
+
+def _write_test_wav(path, duration=3.2, sample_rate=22050, frequency=440, amplitude=1000):
+    frame_count = int(duration * sample_rate)
+    with wave.open(str(path), "w") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        frames = [
+            struct.pack(
+                "<h",
+                int(amplitude * math.sin(2 * math.pi * frequency * i / sample_rate)),
+            )
+            for i in range(frame_count)
+        ]
+        wav_file.writeframes(b"".join(frames))
 
 
 def test_tts_cache_changes_when_segment_text_changes(tmp_path, monkeypatch):
@@ -64,6 +83,215 @@ def test_tts_cache_regenerates_unreadable_cached_file(tmp_path, monkeypatch):
 
     assert calls == ["hello"]
     assert results[0]["cached"] is False
+
+
+def test_xtts_clone_uses_match_fallback_speed(tmp_path):
+    import video_dubbing
+
+    class FakeXTTS:
+        def __init__(self):
+            self._xtts_language = "en"
+            self._speaker_wav = str(tmp_path / "ref.wav")
+            self._requires_speaker_wav = True
+            self.calls = []
+
+        def tts_to_file(self, **kwargs):
+            self.calls.append(kwargs)
+            Path(kwargs["file_path"]).write_bytes(b"valid wav content" * 64)
+
+    ref_path = tmp_path / "ref.wav"
+    ref_path.write_bytes(b"ref")
+    output_path = tmp_path / "out.wav"
+    tts = FakeXTTS()
+
+    video_dubbing.synthesize_speech_coqui_single(
+        tts,
+        speaker_idx=None,
+        text="Hello there.",
+        output_file=str(output_path),
+        target_lang="en",
+    )
+
+    assert len(tts.calls) == 1
+    assert tts.calls[0]["speed"] == video_dubbing.XTTS_CLONE_SPEED
+
+
+def test_clone_reference_rejects_mixed_gender_subtitle_evidence():
+    import video_dubbing
+
+    safe, reason = video_dubbing._speaker_clone_reference_is_safe({
+        "gender": "female",
+        "subtitle_gender": "female",
+        "subtitle_alignments": [
+            {"start": 0.0, "end": 4.0, "final_gender": "female", "final_confidence": 0.90},
+            {"start": 5.0, "end": 7.0, "final_gender": "male", "final_confidence": 0.90},
+        ],
+    })
+
+    assert safe is False
+    assert "mixed-gender" in reason
+
+
+def test_clone_reference_allows_consistent_gender_subtitle_evidence():
+    import video_dubbing
+
+    speaker_info = {
+        "gender": "male",
+        "subtitle_gender": "male",
+        "subtitle_alignments": [
+            {"start": 0.0, "end": 2.0, "final_gender": "male", "final_confidence": 0.90},
+            {"start": 3.0, "end": 5.0, "final_gender": "male", "final_confidence": 0.90},
+        ],
+    }
+    segments, gender = video_dubbing._speaker_reference_segments(speaker_info)
+    safe, reason = video_dubbing._speaker_clone_reference_is_safe(speaker_info, segments, gender)
+
+    assert safe is True
+    assert reason == "ok"
+
+
+def test_clone_reference_segments_keep_only_matching_high_confidence_gender():
+    import video_dubbing
+
+    segments, gender = video_dubbing._speaker_reference_segments({
+        "gender": "unknown",
+        "subtitle_gender": "male",
+        "subtitle_alignments": [
+            {"start": 1.0, "end": 2.0, "final_gender": "male", "final_confidence": 0.90},
+            {"start": 3.0, "end": 4.0, "final_gender": "female", "final_confidence": 0.95},
+            {"start": 5.0, "end": 6.0, "final_gender": "male", "final_confidence": 0.60},
+            {"start": 7.0, "end": 8.0, "segment_gender": "male", "segment_confidence": 0.90},
+        ],
+    })
+
+    assert gender == "male"
+    assert segments == [(1.0, 2.0, 1.0), (7.0, 8.0, 1.0)]
+
+
+def test_clone_reference_writer_accepts_triplet_reference_segments(tmp_path):
+    import video_dubbing
+
+    source = tmp_path / "source_(Vocals)_model_bs_roformer_ep_317_sdr_12.wav"
+    output = tmp_path / "speaker_ref.wav"
+    _write_test_wav(source, duration=4.0)
+
+    success, status = video_dubbing._write_speaker_reference_from_source(
+        source,
+        {"segments": [(0.0, 1.0)]},
+        output,
+        reference_segments=[(0.0, 3.0, 3.0)],
+    )
+
+    assert success is True
+    assert status == "created"
+    assert video_dubbing._probe_audio_duration(str(output)) >= 2.5
+
+
+def test_clone_reference_requires_source_vocals_and_skips_dialogue_fallback(tmp_path):
+    import video_dubbing
+
+    dialogue = tmp_path / "dialogue.wav"
+    _write_test_wav(dialogue, duration=4.0)
+    refs_dir = tmp_path / "refs"
+
+    ref_path, ref_info = video_dubbing._build_speaker_reference_audio(
+        dialogue,
+        "SPEAKER_00",
+        {"segments": [(0.0, 4.0)]},
+        refs_dir,
+        reference_segments=[(0.0, 3.0, 3.0)],
+        expected_manifest={
+            "clone_profile": video_dubbing.XTTS_CLONE_PROFILE,
+            "reference_gender": "male",
+            "selected_segments": [[0.0, 3.0, 3.0]],
+            "source_path": None,
+        },
+        previous_manifest=None,
+    )
+
+    assert ref_path is None
+    assert "无可用参考音频源" in ref_info["reason"]
+    assert not (refs_dir / "SPEAKER_00.wav").exists()
+
+
+def test_clone_reference_rebuilds_when_manifest_mismatches(tmp_path):
+    import video_dubbing
+
+    audio_dir = tmp_path / "01_audio"
+    source_dir = audio_dir / "_work" / "separator_output"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "source_(Vocals)_model_bs_roformer_ep_317_sdr_12.wav"
+    dialogue = audio_dir / "dialogue.wav"
+    refs_dir = tmp_path / "refs"
+    refs_dir.mkdir()
+    output = refs_dir / "SPEAKER_00.wav"
+    _write_test_wav(source, duration=5.0, frequency=440)
+    _write_test_wav(dialogue, duration=5.0, frequency=880)
+    _write_test_wav(output, duration=3.0, frequency=220)
+    old_mtime = output.stat().st_mtime_ns
+
+    ref_path, ref_info = video_dubbing._build_speaker_reference_audio(
+        dialogue,
+        "SPEAKER_00",
+        {"segments": [(0.0, 5.0)]},
+        refs_dir,
+        reference_segments=[(0.0, 3.0, 3.0)],
+        expected_manifest={
+            "clone_profile": video_dubbing.XTTS_CLONE_PROFILE,
+            "reference_gender": "male",
+            "selected_segments": [[0.0, 3.0, 3.0]],
+            "source_path": str(source),
+        },
+        previous_manifest={
+            "clone_profile": "old_profile",
+            "reference_gender": "female",
+            "selected_segments": [[1.0, 4.0, 3.0]],
+            "source_path": str(source),
+        },
+    )
+
+    assert ref_path == str(output)
+    assert ref_info["status"] == "created"
+    assert ref_info["clone_profile"] == video_dubbing.XTTS_CLONE_PROFILE
+    assert ref_info["reference_gender"] == "male"
+    assert ref_info["selected_segments"] == [[0.0, 3.0, 3.0]]
+    assert ref_info["source_path"] == str(source)
+    assert output.stat().st_mtime_ns != old_mtime
+
+
+def test_clone_builder_returns_empty_when_clone_is_disabled(tmp_path, monkeypatch):
+    import video_dubbing
+
+    class FakeRun:
+        def stage_dir(self, stage_name):
+            return tmp_path / stage_name
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("clone builder should not be called when clone is disabled")
+
+    monkeypatch.setattr(video_dubbing, "_is_xtts_v2_downloaded", lambda: True)
+    monkeypatch.setattr(video_dubbing, "_speaker_reference_sources", fail_if_called)
+    monkeypatch.setattr(video_dubbing, "_build_speaker_reference_audio", fail_if_called)
+    monkeypatch.setattr(video_dubbing, "_speaker_clone_reference_is_safe", fail_if_called)
+
+    clone_voices, clone_voice_map = video_dubbing._build_speaker_clone_voices(
+        FakeRun(),
+        str(tmp_path / "dialogue.wav"),
+        {
+            "SPEAKER_00": {
+                "gender": "female",
+                "subtitle_gender": "female",
+                "subtitle_alignments": [
+                    {"start": 0.0, "end": 2.0, "final_gender": "female", "final_confidence": 0.95},
+                ],
+            }
+        },
+        "en",
+        enable_clone_voice=False,
+    )
+
+    assert clone_voices == {}
+    assert clone_voice_map == {}
 
 
 def test_dubbing_uses_separated_background_and_never_original_audio():
@@ -236,6 +464,158 @@ def test_segment_voice_keeps_speaker_specific_voice_for_same_gender():
     )
 
     assert voice == "en_vctk_vits_f002"
+
+
+def test_segment_voice_downgrades_polluted_clone_on_confident_gender_conflict():
+    from speaker_aware_dubbing import get_voice_for_segment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_01": {
+            "gender": "female",
+            "subtitle_gender": "unknown",
+            "segments": [(7.0, 12.0)],
+            "subtitle_alignments": [
+                {
+                    "start": 8.0,
+                    "end": 9.0,
+                    "final_gender": "male",
+                    "final_confidence": 0.90,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_01": "clone_SPEAKER_01"}
+
+    voice = get_voice_for_segment(
+        8.0,
+        9.0,
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert voice == "en_vctk_vits_m001"
+
+
+def test_segment_voice_keeps_clone_when_speaker_context_is_stable():
+    from speaker_aware_dubbing import get_voice_for_segment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_01": {
+            "gender": "male",
+            "subtitle_gender": "male",
+            "segments": [(17.0, 20.5)],
+            "subtitle_alignments": [
+                {
+                    "start": 18.4,
+                    "end": 19.3,
+                    "final_gender": "female",
+                    "final_confidence": 0.90,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_01": "clone_SPEAKER_01"}
+
+    voice = get_voice_for_segment(
+        18.4,
+        19.3,
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert voice == "clone_SPEAKER_01"
+
+
+def test_segment_voice_downgrades_clone_when_only_subtitle_gender_conflicts():
+    from speaker_aware_dubbing import get_voice_for_segment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_01": {
+            "gender": "unknown",
+            "subtitle_gender": "male",
+            "segments": [(74.0, 98.0)],
+            "subtitle_alignments": [
+                {
+                    "start": 75.56,
+                    "end": 77.11,
+                    "final_gender": "female",
+                    "final_confidence": 0.90,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_01": "clone_SPEAKER_01"}
+
+    voice = get_voice_for_segment(
+        75.56,
+        77.11,
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert voice == "en_vctk_vits_f001"
+
+
+def test_voice_alignment_diagnostics_marks_clone_gender_downgrade_as_segment_override():
+    from speaker_aware_dubbing import explain_segment_voice_alignment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_01": {
+            "gender": "female",
+            "subtitle_gender": "unknown",
+            "segments": [(7.0, 12.0)],
+            "subtitle_alignments": [
+                {
+                    "start": 8.0,
+                    "end": 9.0,
+                    "final_gender": "male",
+                    "final_confidence": 0.90,
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_01": "clone_SPEAKER_01"}
+
+    report = explain_segment_voice_alignment(
+        8.0,
+        9.0,
+        "高置信男声",
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert report["voice"] == "en_vctk_vits_m001"
+    assert report["voice_gender"] == "male"
+    assert report["voice_source"] == "segment_override"
+    assert report["speaker_default_voice"] == "clone_SPEAKER_01"
 
 
 def test_voice_alignment_diagnostics_marks_review_reasons():

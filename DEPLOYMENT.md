@@ -120,6 +120,14 @@ trans_env\Scripts\python video_dubbing.py --help
 trans_env\Scripts\python video_subtitles_only.py --help
 ```
 
+如果你想临时关闭原视频 speaker clone，可直接在配音命令里加：
+
+```bat
+trans_env\Scripts\python video_dubbing.py --mode single --input_video D:\media\movie.mp4 --target_lang en --voice en_vctk_vits_m001 --output_video D:\result\movie_en.mp4 --clone_voice false
+```
+
+这个开关只影响“原视频 speaker clone”的构建与注入，不影响非英语系预置 clone voice。
+
 ### 5.3 性别模型目录检查
 
 确认以下文件存在：
@@ -182,3 +190,13 @@ pip install --force-reinstall "numpy>=1.24.0,<2.0.0"
 
 原因：`HF_TOKEN` 未设置、无效，或未先同意 pyannote 模型协议。  
 修复：重新配置 token，并确认已同意模型协议。
+
+### 6.5 旧的 speaker clone 参考音频不更新
+
+如果你调整了 clone 采样策略，或者怀疑旧的 `speaker_refs/SPEAKER_*.wav` 仍在污染输出，删除目标视频输出目录中的：
+
+```text
+05_tts/speaker_refs/
+```
+
+然后重新跑该视频。`speaker_refs_manifest.json` 会在重跑时重新写入，并根据新的采样结果重建参考音频。

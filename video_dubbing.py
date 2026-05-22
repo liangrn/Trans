@@ -36,7 +36,7 @@ except ImportError as _mpy_err:
     )
 
 from PIL import Image, ImageDraw, ImageFont
-from pipeline_cache import get_pipeline_run, get_stage_source
+from pipeline_cache import cascade_delete_dependents, get_pipeline_run, get_stage_source
 from pipeline_cache import is_stage_complete
 from pipeline_stages import (
     get_or_create_audio_stage,
@@ -132,6 +132,8 @@ FFMPEG_BIN = _resolve_ffmpeg_bin()
 
 XTTS_V2_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
 XTTS_REQUIRED_FILES = ("model.pth", "config.json", "vocab.json", "speakers_xtts.pth")
+XTTS_CLONE_SPEED = 1.18
+XTTS_CLONE_PROFILE = "xtts_clone_match_fallback_v1"
 XTTS_LANGUAGE_MAP = {
     "en": "en", "ja": "ja", "ko": "ko", "zh": "zh-cn",
     "es": "es", "fr": "fr", "de": "de", "it": "it",
@@ -678,9 +680,6 @@ def _speaker_reference_sources(dialogue_path):
         if separator_dir.exists():
             for path in sorted(separator_dir.glob("*Vocals*.wav")):
                 sources.append(("source_vocals", path))
-        sources.append(("work_vocals", audio_dir / "_work" / "vocals.wav"))
-    if dialogue:
-        sources.append(("dialogue", dialogue))
 
     seen = set()
     unique_sources = []
@@ -693,7 +692,62 @@ def _speaker_reference_sources(dialogue_path):
     return unique_sources
 
 
-def _write_speaker_reference_from_source(source_path, speaker_info, output_path):
+def _speaker_reference_segments(speaker_info, min_confidence=0.85):
+    speaker_gender = speaker_info.get("gender", "unknown")
+    subtitle_gender = speaker_info.get("subtitle_gender", "unknown")
+    target_gender = speaker_gender if speaker_gender in ("male", "female") else subtitle_gender
+    if target_gender not in ("male", "female"):
+        return [], target_gender
+
+    candidates = []
+    for item in speaker_info.get("subtitle_alignments") or []:
+        gender = item.get("final_gender") or item.get("segment_gender")
+        confidence = float(item.get("final_confidence", item.get("segment_confidence", 0.0)) or 0.0)
+        if gender != target_gender or confidence < min_confidence:
+            continue
+        start = float(item.get("start", 0.0) or 0.0)
+        end = float(item.get("end", start) or start)
+        duration = max(0.0, end - start)
+        if duration >= 0.45:
+            candidates.append((start, end, duration))
+    return candidates, target_gender
+
+
+def _normalize_reference_segments(reference_segments):
+    normalized = []
+    for raw in reference_segments or []:
+        if len(raw) < 2:
+            continue
+        start = float(raw[0])
+        end = float(raw[1])
+        duration = float(raw[2]) if len(raw) >= 3 else max(0.0, end - start)
+        normalized.append([round(start, 3), round(end, 3), round(max(0.0, duration), 3)])
+    return normalized
+
+
+def _speaker_reference_manifest(
+    source_path,
+    reference_segments,
+    reference_gender,
+):
+    return {
+        "clone_profile": XTTS_CLONE_PROFILE,
+        "reference_gender": reference_gender,
+        "selected_segments": _normalize_reference_segments(reference_segments),
+        "source_path": str(source_path) if source_path else None,
+    }
+
+
+def _speaker_reference_manifest_matches(previous_manifest, expected_manifest):
+    if not previous_manifest or not expected_manifest:
+        return False
+    for key, expected_value in expected_manifest.items():
+        if previous_manifest.get(key) != expected_value:
+            return False
+    return True
+
+
+def _write_speaker_reference_from_source(source_path, speaker_info, output_path, reference_segments=None):
     if not source_path or not os.path.exists(source_path):
         return False, "源文件不存在"
 
@@ -701,16 +755,19 @@ def _write_speaker_reference_from_source(source_path, speaker_info, output_path)
     if source_duration <= 0.1:
         return False, "源文件时长异常"
 
-    segments = speaker_info.get("segments", [])
+    segments = reference_segments if reference_segments is not None else speaker_info.get("segments", [])
     if not segments:
-        return False, "无 speaker 片段"
+        return False, "无可用参考片段"
 
     audio = None
     try:
         audio = AudioFileClip(str(source_path))
         audio_duration = max(0.0, float(audio.duration or source_duration))
         candidates = []
-        for raw_start, raw_end in segments:
+        for raw_segment in segments:
+            if len(raw_segment) < 2:
+                continue
+            raw_start, raw_end = raw_segment[0], raw_segment[1]
             start = max(0.0, min(float(raw_start), max(0.0, audio_duration - 0.05)))
             end = max(start + 0.05, min(float(raw_end), max(0.05, audio_duration - 0.02)))
             duration = end - start
@@ -753,28 +810,48 @@ def _write_speaker_reference_from_source(source_path, speaker_info, output_path)
             audio.close()
 
 
-def _build_speaker_reference_audio(dialogue_path, speaker_id, speaker_info, refs_dir):
+def _build_speaker_reference_audio(
+    dialogue_path,
+    speaker_id,
+    speaker_info,
+    refs_dir,
+    reference_segments=None,
+    expected_manifest=None,
+    previous_manifest=None,
+):
     refs_dir.mkdir(parents=True, exist_ok=True)
     output_path = refs_dir / f"{speaker_id}.wav"
     if _is_valid_speaker_reference(output_path):
-        return str(output_path), {
-            "status": "cached",
-            "source": "cached",
-            "duration": _probe_audio_duration(str(output_path)),
-            "rms": _wav_rms(output_path),
-        }
+        if expected_manifest is None or _speaker_reference_manifest_matches(previous_manifest, expected_manifest):
+            cached_info = {
+                "status": "cached",
+                "source": "cached",
+                "duration": _probe_audio_duration(str(output_path)),
+                "rms": _wav_rms(output_path),
+            }
+            if expected_manifest:
+                cached_info.update(expected_manifest)
+            return str(output_path), cached_info
+        _safe_remove(str(output_path))
 
     failures = []
     for source_label, source_path in _speaker_reference_sources(dialogue_path):
-        success, status = _write_speaker_reference_from_source(source_path, speaker_info, output_path)
+        success, status = _write_speaker_reference_from_source(
+            source_path, speaker_info, output_path, reference_segments=reference_segments
+        )
         if success:
-            return str(output_path), {
+            info = {
                 "status": status,
                 "source": source_label,
                 "source_path": str(source_path),
                 "duration": _probe_audio_duration(str(output_path)),
                 "rms": _wav_rms(output_path),
             }
+            if expected_manifest:
+                info.update(expected_manifest)
+            else:
+                info.update({"source_path": str(source_path)})
+            return str(output_path), info
         failures.append(f"{source_label}: {status}")
     return None, {
         "status": "failed",
@@ -783,8 +860,17 @@ def _build_speaker_reference_audio(dialogue_path, speaker_id, speaker_info, refs
     }
 
 
-def _build_speaker_clone_voices(pipeline_run, dialogue_path, speaker_map, target_lang):
+def _build_speaker_clone_voices(
+    pipeline_run,
+    dialogue_path,
+    speaker_map,
+    target_lang,
+    enable_clone_voice=True,
+):
     if not speaker_map:
+        return {}, {}
+    if not enable_clone_voice:
+        print("  [Speaker Clone] 原视频 clone 已关闭，跳过原视频音色克隆")
         return {}, {}
     if not _is_xtts_v2_downloaded():
         print("  [Speaker Clone] XTTS-v2 未完整下载，跳过原视频音色克隆，使用原有声音分配")
@@ -795,9 +881,43 @@ def _build_speaker_clone_voices(pipeline_run, dialogue_path, speaker_map, target
     clone_voices = {}
     clone_voice_map = {}
     manifest = {}
+    manifest_path = refs_dir / "speaker_refs_manifest.json"
+    previous_manifest = {}
+    try:
+        if manifest_path.exists():
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                previous_manifest = json.load(f) or {}
+    except Exception:
+        previous_manifest = {}
     print("  [Speaker Clone] 构建原视频说话人参考音频...")
     for speaker_id, info in sorted(speaker_map.items()):
-        ref_path, ref_info = _build_speaker_reference_audio(dialogue_path, speaker_id, info, refs_dir)
+        reference_segments, reference_gender = _speaker_reference_segments(info)
+        source_candidates = _speaker_reference_sources(dialogue_path)
+        source_path = source_candidates[0][1] if source_candidates else None
+        expected_manifest = _speaker_reference_manifest(
+            source_path,
+            reference_segments,
+            reference_gender,
+        )
+        safe_for_clone, unsafe_reason = _speaker_clone_reference_is_safe(info, reference_segments, reference_gender)
+        if not safe_for_clone:
+            manifest[speaker_id] = {
+                "status": "skipped",
+                "source": None,
+                "reason": unsafe_reason,
+                **expected_manifest,
+            }
+            print(f"    {speaker_id}: 跳过 ({unsafe_reason})")
+            continue
+        ref_path, ref_info = _build_speaker_reference_audio(
+            dialogue_path,
+            speaker_id,
+            info,
+            refs_dir,
+            reference_segments=reference_segments,
+            expected_manifest=expected_manifest,
+            previous_manifest=previous_manifest.get(speaker_id),
+        )
         manifest[speaker_id] = ref_info
         if not ref_path:
             print(f"    {speaker_id}: 跳过 ({ref_info.get('reason') or ref_info.get('status')})")
@@ -816,12 +936,47 @@ def _build_speaker_clone_voices(pipeline_run, dialogue_path, speaker_map, target
             f"from {ref_info.get('source')} -> {ref_path}"
         )
     try:
-        manifest_path = refs_dir / "speaker_refs_manifest.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"  [Speaker Clone] 写入参考音频 manifest 失败: {e}")
     return clone_voices, clone_voice_map
+
+
+def _speaker_clone_reference_is_safe(speaker_info, reference_segments=None, reference_gender=None):
+    speaker_gender = speaker_info.get("gender", "unknown")
+    subtitle_gender = speaker_info.get("subtitle_gender", "unknown")
+    if speaker_gender in ("male", "female") and subtitle_gender in ("male", "female") and speaker_gender != subtitle_gender:
+        return False, f"speaker/subtitle gender conflict ({speaker_gender} vs {subtitle_gender})"
+
+    effective_gender = reference_gender or (speaker_gender if speaker_gender in ("male", "female") else subtitle_gender)
+    if effective_gender not in ("male", "female"):
+        return False, "speaker gender unknown"
+
+    alignments = speaker_info.get("subtitle_alignments") or []
+    same_score = 0.0
+    opposite_score = 0.0
+    for item in alignments:
+        gender = item.get("final_gender") or item.get("segment_gender")
+        confidence = float(item.get("final_confidence", item.get("segment_confidence", 0.0)) or 0.0)
+        if gender not in ("male", "female") or confidence < 0.85:
+            continue
+        duration = max(0.0, float(item.get("end", 0.0) or 0.0) - float(item.get("start", 0.0) or 0.0))
+        score = max(duration, 0.2) * confidence
+        if gender == effective_gender:
+            same_score += score
+        else:
+            opposite_score += score
+
+    if same_score < 2.5:
+        return False, "not enough same-gender subtitle evidence"
+    if opposite_score > max(0.6, same_score * 0.15):
+        return False, f"mixed-gender subtitle evidence (same={same_score:.2f}, opposite={opposite_score:.2f})"
+    selected_duration = sum(item[2] for item in (reference_segments or []))
+    if selected_duration < 2.5:
+        return False, f"filtered reference audio too short: {selected_duration:.2f}s"
+
+    return True, "ok"
 
 
 def _load_reference_tts_model(voice_config):
@@ -904,7 +1059,7 @@ def load_coqui_tts_model(voice_config, gpu_is_available=False):
         tts._model_name = model_name
         tts._speaker_wav = speaker_wav
         tts._requires_speaker_wav = requires_speaker_wav
-        tts._tts_generation_profile = "xtts_clone_slightly_fast_v1" if speaker_wav else "default"
+        tts._tts_generation_profile = XTTS_CLONE_PROFILE if speaker_wav else "default"
         return tts, speaker_idx
     except Exception as e:
         # 明确警告：不再静默，避免用户不知情地收到英语配音
@@ -991,7 +1146,7 @@ def synthesize_speech_coqui_single(tts_instance, speaker_idx, text, output_file,
                         top_p=0.8,
                         top_k=40,
                         repetition_penalty=8.0,
-                        speed=1.08,
+                        speed=XTTS_CLONE_SPEED,
                     )
                 elif getattr(tts_instance, '_requires_speaker_wav', False):
                     raise RuntimeError("XTTS 克隆声音缺少有效 speaker_wav，拒绝使用默认 speaker")
@@ -1386,7 +1541,58 @@ def create_subtitle_clip(text, start_time, duration, video_width, video_height, 
         empty_clip.temp_path = None
         return empty_clip
 
-def process_single_video(input_video_path, target_language, selected_voice_key, output_video_path, max_speed_factor, min_speed_factor, available_voices, parallel=True, workers=10, tts_workers=3):
+def _print_stage_timing_summary(stage_timings):
+    if not stage_timings:
+        return
+    print("\n[耗时统计]")
+    ordered_labels = [
+        ("01_audio", "01 音频分离"),
+        ("02_recognition", "02 文本识别"),
+        ("01_02_wall", "01/02 并行墙钟耗时"),
+        ("03_speaker_gender_elapsed", "03 说话人/性别识别(后台总耗时)"),
+        ("03_speaker_gender_wait", "03 说话人/性别识别(实际等待)"),
+        ("04_translation", "04 翻译"),
+        ("04_tts_model_load", "04 TTS模型加载"),
+        ("05_tts", "05 TTS生成+调速"),
+        ("06_composition", "06 视频合成"),
+        ("total", "总耗时"),
+    ]
+    for key, label in ordered_labels:
+        if key in stage_timings:
+            suffix = ""
+            if key == "02_recognition" and stage_timings.get("02_recognition_source"):
+                suffix = f" (source={stage_timings['02_recognition_source']})"
+            print(f"  {label}: {stage_timings[key]:.1f}s{suffix}")
+    if stage_timings.get("ocr_block_workers"):
+        print(f"  OCR block workers: {stage_timings['ocr_block_workers']}")
+    if (
+        "01_02_wall" in stage_timings
+        or ("03_speaker_gender_elapsed" in stage_timings and "04_translation" in stage_timings)
+    ):
+        print("  注: 01 与 02、03 与 04 可能存在并行重叠，分项耗时不能直接相加为总耗时")
+
+
+def _run_stage_timed(func, *args, **kwargs):
+    started_at = time.time()
+    try:
+        return func(*args, **kwargs), time.time() - started_at, None
+    except Exception as exc:
+        return None, time.time() - started_at, exc
+
+
+def process_single_video(
+    input_video_path,
+    target_language,
+    selected_voice_key,
+    output_video_path,
+    max_speed_factor,
+    min_speed_factor,
+    available_voices,
+    parallel=True,
+    workers=10,
+    tts_workers=3,
+    enable_clone_voice=True,
+):
     """处理单个视频的函数 - 修复资源泄漏版
 
     Args:
@@ -1410,6 +1616,9 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         return False
     
     print(f"--- 开始处理: {input_video_path} ---")
+    process_started_at = time.time()
+    stage_timings = {}
+    speaker_started_at = None
     # 强制垃圾回收
     gc.collect()
     
@@ -1459,49 +1668,96 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
 
         # Step 1: 文本识别（优先 OCR 硬字幕；无可用字幕才跑 ASR）
         print("\n[1/6] 文本识别...")
+        stage_started_at = time.time()
         
         try:
             audio_stage_dir = pipeline_run.stage_dir("audio")
+            recognition_stage_dir = pipeline_run.stage_dir("recognition")
             audio_stage_ready = is_stage_complete(
                 pipeline_run,
                 "audio",
                 [audio_stage_dir / "background.wav", audio_stage_dir / "dialogue.wav"],
             )
-            recognition_source = get_stage_source(pipeline_run, "recognition")
+            recognition_stage_ready = is_stage_complete(
+                pipeline_run,
+                "recognition",
+                [
+                    recognition_stage_dir / "recognized_segments.json",
+                    recognition_stage_dir / "recognized_text.txt",
+                ],
+            )
 
-            if not audio_stage_ready and recognition_source != "ocr":
-                separation_result = get_or_create_audio_stage(pipeline_run, input_video_path, video_duration)
-                segments = get_or_create_recognition_stage(
+            if not audio_stage_ready:
+                cascade_delete_dependents(pipeline_run, "audio")
+                recognition_stage_ready = is_stage_complete(
+                    pipeline_run,
+                    "recognition",
+                    [
+                        recognition_stage_dir / "recognized_segments.json",
+                        recognition_stage_dir / "recognized_text.txt",
+                    ],
+                )
+            if not recognition_stage_ready:
+                cascade_delete_dependents(pipeline_run, "recognition")
+
+            # OCR 和音频分离互不依赖，并行启动；只有 OCR 不可用时才等待 dialogue.wav 做 ASR。
+            def run_audio_stage():
+                return get_or_create_audio_stage(
                     pipeline_run,
                     input_video_path,
                     video_duration,
-                    separation_result.dialogue_path,
+                    cascade=False,
                 )
-            else:
-                # OCR 和音频分离互不依赖，先并行启动；只有 OCR 不可用时才等待 dialogue.wav 做 ASR。
-                with ThreadPoolExecutor(max_workers=2) as stage_executor:
-                    audio_future = stage_executor.submit(
-                        get_or_create_audio_stage, pipeline_run, input_video_path, video_duration
-                    )
-                    recognition_future = stage_executor.submit(
-                        get_or_create_recognition_stage,
-                        pipeline_run,
-                        input_video_path,
-                        video_duration,
-                        None,
-                    )
-                    try:
-                        segments = recognition_future.result()
-                        separation_result = audio_future.result()
-                    except Exception:
-                        separation_result = audio_future.result()
-                        segments = get_or_create_recognition_stage(
+
+            def run_ocr_recognition_stage():
+                return get_or_create_recognition_stage(
+                    pipeline_run,
+                    input_video_path,
+                    video_duration,
+                    None,
+                    True,
+                    cascade=False,
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as stage_executor:
+                audio_future = stage_executor.submit(
+                    _run_stage_timed,
+                    run_audio_stage,
+                )
+                recognition_future = stage_executor.submit(
+                    _run_stage_timed,
+                    run_ocr_recognition_stage,
+                )
+
+                segments, recognition_elapsed, recognition_error = recognition_future.result()
+                separation_result, audio_elapsed, audio_error = audio_future.result()
+                if audio_error:
+                    raise audio_error
+
+                if recognition_error:
+                    def run_asr_recognition_stage():
+                        return get_or_create_recognition_stage(
                             pipeline_run,
                             input_video_path,
                             video_duration,
                             separation_result.dialogue_path,
-                            try_ocr=False,
+                            False,
+                            cascade=False,
                         )
+
+                    segments, fallback_elapsed, fallback_error = _run_stage_timed(run_asr_recognition_stage)
+                    recognition_elapsed += fallback_elapsed
+                    if fallback_error:
+                        raise fallback_error
+
+            stage_timings["01_audio"] = audio_elapsed
+            stage_timings["02_recognition"] = recognition_elapsed
+            stage_timings["01_02_wall"] = time.time() - stage_started_at
+            recognition_source = get_stage_source(pipeline_run, "recognition")
+            if recognition_source:
+                stage_timings["02_recognition_source"] = recognition_source
+            if recognition_source == "ocr" and video_duration > 300:
+                stage_timings["ocr_block_workers"] = 2
 
             asr_audio_path = separation_result.dialogue_path
             background_audio_path = separation_result.background_path
@@ -1518,6 +1774,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 if _hf_token and not speaker_stage_ready:
                     run_diarization_async(asr_audio_path, _hf_token)
                     speaker_diarization_started = True
+                    speaker_started_at = time.time()
             # =========================================================
             
             original_segments_data = []
@@ -1570,6 +1827,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         # Step 3: 翻译
         print(f"\n[3/6] 翻译为 {target_language}...")
+        stage_started_at = time.time()
         translated_segments_data = []
 
         try:
@@ -1583,6 +1841,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             print(f"  - 翻译失败，已停止后续 TTS/合成: {e}")
             _cleanup_background_speaker_task()
             return False
+        stage_timings["04_translation"] = time.time() - stage_started_at
         for result in translated_results:
             translated_segments_data.append({
                 "idx": result.get("idx"),
@@ -1598,7 +1857,11 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             _hf_token = os.environ.get('HF_TOKEN', '')
             if _hf_token:
                 print('\n[2/6] 获取说话人分离结果...')
+                stage_started_at = time.time()
                 speaker_map = get_or_create_speaker_gender_stage(pipeline_run, wait_diarization)
+                stage_timings["03_speaker_gender_wait"] = time.time() - stage_started_at
+                if speaker_started_at is not None:
+                    stage_timings["03_speaker_gender_elapsed"] = time.time() - speaker_started_at
                 speaker_diarization_started = False
                 if not speaker_map:
                     print('  [说话人识别] 结果为空，使用单一声音')
@@ -1620,6 +1883,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 asr_audio_path,
                 speaker_map,
                 target_language,
+                enable_clone_voice=enable_clone_voice,
             )
             if clone_voices:
                 runtime_available_voices = dict(available_voices)
@@ -1630,6 +1894,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
 
         # Step 4: 加载TTS模型
         print("\n[4/6] 加载TTS模型...")
+        stage_started_at = time.time()
         voice_config = runtime_available_voices.get(selected_voice_key,
                                             {"model_name": "tts_models/en/ljspeech/vits"})
         
@@ -1643,9 +1908,11 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                 return False
         else:
             print("  - 多说话人模式：按片段声音分组延迟加载 TTS 模型")
+        stage_timings["04_tts_model_load"] = time.time() - stage_started_at
         
         # Step 5: 生成并调整TTS音频
         print("\n[5/6] 生成并调整配音音频...")
+        stage_started_at = time.time()
         invalidate_composition_for_tts(pipeline_run)
 
         # 5.1 并行生成所有 TTS 音频
@@ -1727,7 +1994,8 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
             temp_tts_file = tts_result["temp_tts_file"]
 
             print(f"\n--- 处理片段 {order_idx+1}/{len(successful_tts_results)} ---")
-            print(f"    原时间: [{seg_data['start']:.2f}s -> {seg_data['end']:.2f}s], 时长: {seg_data['original_duration']:.2f}s")
+            print(f"    原时间: [{seg_data['start']:.2f}s -> {seg_data['end']:.2f}s], 字幕时长: {seg_data['original_duration']:.2f}s")
+            print(f"    TTS原始时长: {tts_result.get('raw_duration', timeline_entry['raw_tts_duration']):.2f}s, 目标窗口: {timeline_entry['target_duration']:.2f}s")
 
             # 调整音频速度
             tmp_adj = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
@@ -1744,10 +2012,10 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                     max_speed_factor=max_speed_factor,
                     min_speed_factor=min_speed_factor
                 )
-                adjusted_durations.append(_probe_audio_duration(temp_adjusted_file))
+                measured_duration = _probe_audio_duration(temp_adjusted_file)
+                adjusted_durations.append(min(measured_duration, timeline_entry["target_duration"]))
                 print(
-                    f"    调整后时长: {final_duration:.2f}s, 速度: {speed_factor:.2f}x, "
-                    f"目标窗口: {timeline_entry['target_duration']:.2f}s"
+                    f"    调整后时长: {final_duration:.2f}s, 速度: {speed_factor:.2f}x"
                 )
             except Exception as e:
                 print(f"    - 音频速度调整失败: {e}")
@@ -1824,9 +2092,11 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         )
         del tts_model
         gc.collect()
+        stage_timings["05_tts"] = time.time() - stage_started_at
         
         # Step 6: 合成最终视频
         print("\n[6/6] 合成最终视频...")
+        stage_started_at = time.time()
         print("  - 合成音频轨道 (使用绝对时间对齐)...")
         
         try:
@@ -1888,6 +2158,7 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
                         output_video_path,
                         expected_min_duration=final_output_duration,
                     )
+                    stage_timings["06_composition"] = time.time() - stage_started_at
                     return True
                 else:
                     print(f"  - ✗ 输出文件过小: {file_size} bytes")
@@ -1950,6 +2221,8 @@ def process_single_video(input_video_path, target_language, selected_voice_key, 
         
         # 强制垃圾回收
         gc.collect()
+        stage_timings["total"] = time.time() - process_started_at
+        _print_stage_timing_summary(stage_timings)
         
         print("- 资源清理完成")
 
@@ -2189,7 +2462,20 @@ def merge_videos_from_directory(output_dir, merged_filename, video_extension=".m
         print(f"   3. 视频文件是否被其他程序占用")
         return False
 
-def batch_process_videos(input_dir, output_dir, target_language, selected_voice_key, max_speed_factor, min_speed_factor, available_voices, video_extension=".mp4", parallel=True, workers=10, tts_workers=3):
+def batch_process_videos(
+    input_dir,
+    output_dir,
+    target_language,
+    selected_voice_key,
+    max_speed_factor,
+    min_speed_factor,
+    available_voices,
+    video_extension=".mp4",
+    parallel=True,
+    workers=10,
+    tts_workers=3,
+    enable_clone_voice=True,
+):
     """批量处理指定目录下的所有视频文件
 
     Args:
@@ -2265,7 +2551,8 @@ def batch_process_videos(input_dir, output_dir, target_language, selected_voice_
             available_voices,
             parallel=parallel,
             workers=workers,
-            tts_workers=tts_workers
+            tts_workers=tts_workers,
+            enable_clone_voice=enable_clone_voice
         )
         if not success:
             print(f"警告: 处理 '{input_video_path}' 时失败。跳过此文件。")
@@ -2333,7 +2620,7 @@ def _generate_tts_multi_voice(
                 tts_model._speaker_wav = voice_config.get("speaker_wav")
                 tts_model._requires_speaker_wav = bool(voice_config.get("requires_speaker_wav"))
                 tts_model._tts_generation_profile = (
-                    "xtts_clone_slightly_fast_v1" if voice_config.get("speaker_wav") else "default"
+                    XTTS_CLONE_PROFILE if voice_config.get("speaker_wav") else "default"
                 )
                 print("    - 复用已加载 TTS 模型")
             else:
@@ -2351,7 +2638,7 @@ def _generate_tts_multi_voice(
                 tts_model._speaker_wav = fallback_cfg.get("speaker_wav")
                 tts_model._requires_speaker_wav = bool(fallback_cfg.get("requires_speaker_wav"))
                 tts_model._tts_generation_profile = (
-                    "xtts_clone_slightly_fast_v1" if fallback_cfg.get("speaker_wav") else "default"
+                    XTTS_CLONE_PROFILE if fallback_cfg.get("speaker_wav") else "default"
                 )
             else:
                 tts_model, tts_speaker_idx = load_coqui_tts_model(fallback_cfg, gpu_available)
@@ -2416,6 +2703,8 @@ def main():
                         help="并行翻译线程数 (默认: 10, 推荐 5-20)")
     parser.add_argument("--tts_workers", type=int, default=3,
                         help="并行 TTS 生成线程数 (默认: 3, CPU 模式推荐 2-3)")
+    parser.add_argument("--clone_voice", type=lambda x: x.lower() != 'false', default=True,
+                        help="是否启用原视频 speaker clone (默认: True, 设置为 false 完全关闭)")
 
     args = parser.parse_args()
 
@@ -2442,7 +2731,8 @@ def main():
         success = process_single_video(
             args.input_video, args.target_lang, args.voice,
             args.output_video, args.max_speed, args.min_speed, available_voices,
-            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers
+            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers,
+            enable_clone_voice=args.clone_voice
         )
         if success:
              print("\n--- 单文件处理完成 ---")
@@ -2461,7 +2751,8 @@ def main():
         batch_process_videos(
             args.input_dir, args.output_dir, args.target_lang, args.voice,
             args.max_speed, args.min_speed, available_voices,
-            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers
+            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers,
+            enable_clone_voice=args.clone_voice
         )
         print("\n--- 批量处理完成 ---")
 
@@ -2478,7 +2769,8 @@ def main():
         batch_process_videos(
             args.input_dir, args.output_dir, args.target_lang, args.voice,
             args.max_speed, args.min_speed, available_voices,
-            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers
+            parallel=args.parallel, workers=args.workers, tts_workers=args.tts_workers,
+            enable_clone_voice=args.clone_voice
         )
         print("\n--- 批量处理完成，开始合并 ---")
         merge_videos_from_directory(args.output_dir, args.merged_filename)
