@@ -1,6 +1,7 @@
 """Hard subtitle OCR helpers backed by PaddleOCR in a separate `ocr_env`."""
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 import json
 import os
@@ -11,6 +12,9 @@ import time
 
 
 OCR_BLOCK_SECONDS = 300.0
+OCR_BLOCK_WORKERS = 2
+OCR_BLOCK_OVERLAP_SECONDS = 1.0
+OCR_BLOCK_FORMAT = "ocr_block_v2"
 
 
 def get_ocr_subtitle_segments(video_path: str, video_duration: float, cache_dir: str | Path | None = None) -> list[dict]:
@@ -35,21 +39,67 @@ def get_ocr_subtitle_segments(video_path: str, video_duration: float, cache_dir:
 
 def _get_or_create_ocr_blocks(video_path: str, video_duration: float, cache_dir: Path) -> list[dict]:
     block_ranges = _build_ocr_block_ranges(video_duration)
-    cached_blocks: list[list[dict]] = []
-    all_cached = True
+    blocks: dict[int, list[dict]] = {}
+    missing_blocks: list[tuple[int, float, float]] = []
     for block_index, (start_time, end_time) in enumerate(block_ranges):
         block_path = cache_dir / f"block_{block_index:03d}.json"
         cached = _load_cached_ocr_block(block_path, start_time, end_time)
         if cached is None:
-            all_cached = False
-            break
-        cached_blocks.append(cached)
-    if all_cached:
-        return [segment for block in cached_blocks for segment in block]
+            missing_blocks.append((block_index, start_time, end_time))
+        else:
+            blocks[block_index] = cached
 
-    raw_segments = _run_ocr_probe(video_path)
-    _write_ocr_blocks(cache_dir, block_ranges, raw_segments)
-    return raw_segments
+    if missing_blocks:
+        if len(missing_blocks) == 1:
+            block_index, start_time, end_time = missing_blocks[0]
+            blocks[block_index] = _run_and_cache_ocr_block(
+                video_path, video_duration, cache_dir, block_index, start_time, end_time
+            )
+        else:
+            workers = max(1, min(OCR_BLOCK_WORKERS, len(missing_blocks)))
+            print(f"  - OCR 分块并行: {len(missing_blocks)} 个缺失块, workers={workers}")
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        _run_and_cache_ocr_block,
+                        video_path,
+                        video_duration,
+                        cache_dir,
+                        block_index,
+                        start_time,
+                        end_time,
+                    ): block_index
+                    for block_index, start_time, end_time in missing_blocks
+                }
+                for future in as_completed(futures):
+                    blocks[futures[future]] = future.result()
+
+    merged_segments = [
+        segment
+        for block_index in range(len(block_ranges))
+        for segment in blocks.get(block_index, [])
+    ]
+    merged_segments.sort(key=lambda item: float(item.get("start", 0.0)))
+    return merged_segments
+
+
+def _run_and_cache_ocr_block(
+    video_path: str,
+    video_duration: float,
+    cache_dir: Path,
+    block_index: int,
+    start_time: float,
+    end_time: float,
+) -> list[dict]:
+    probe_start = max(0.0, start_time - OCR_BLOCK_OVERLAP_SECONDS)
+    probe_end = min(float(video_duration or end_time), end_time + OCR_BLOCK_OVERLAP_SECONDS)
+    raw_segments = _run_ocr_probe(video_path, start_time=probe_start, end_time=probe_end)
+    block_segments = [
+        segment for segment in raw_segments
+        if start_time <= float(segment.get("start", 0.0)) < end_time
+    ]
+    _write_ocr_block(cache_dir / f"block_{block_index:03d}.json", start_time, end_time, block_segments)
+    return block_segments
 
 
 def _build_ocr_block_ranges(video_duration: float, block_seconds: float = OCR_BLOCK_SECONDS) -> list[tuple[float, float]]:
@@ -72,7 +122,7 @@ def _load_cached_ocr_block(block_path: Path, start_time: float, end_time: float)
         data = json.loads(block_path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    if not isinstance(data, dict) or data.get("format") != "ocr_block_v1":
+    if not isinstance(data, dict) or data.get("format") != OCR_BLOCK_FORMAT:
         return None
     if abs(float(data.get("start", -1.0)) - float(start_time)) > 0.01:
         return None
@@ -86,7 +136,7 @@ def _load_cached_ocr_block(block_path: Path, start_time: float, end_time: float)
 
 def _write_ocr_block(block_path: Path, start_time: float, end_time: float, segments: list[dict]) -> None:
     payload = {
-        "format": "ocr_block_v1",
+        "format": OCR_BLOCK_FORMAT,
         "start": start_time,
         "end": end_time,
         "segments": segments,
@@ -125,7 +175,7 @@ def _run_ocr_probe(video_path: str, start_time: float | None = None, end_time: f
             "--output_json",
             output_json_path,
             "--interval",
-            "0.33",
+            "0.5",
             "--fast_interval",
             "0.75",
             "--crop_top",

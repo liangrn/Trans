@@ -28,11 +28,30 @@ def test_mid_sentence_speedup_fits_next_window_without_delay():
 
 
 def test_cascade_delay_until_later_gap_then_recovers():
-    timeline = build_tts_timeline(_segments(), [2.4, 2.2, 0.7], 8.0, max_speed_factor=1.35)
+    segments = [
+        {"start": 0.0, "end": 1.4, "original_duration": 1.4, "translated_text": "a"},
+        {"start": 1.6, "end": 2.6, "original_duration": 1.0, "translated_text": "b"},
+        {"start": 5.0, "end": 6.0, "original_duration": 1.0, "translated_text": "c"},
+    ]
+    timeline = build_tts_timeline(segments, [2.4, 2.2, 0.7], 8.0, max_speed_factor=1.35)
 
     assert timeline[0]["overflow_reason"] == "cascade_delay"
     assert timeline[1]["planned_start"] > 1.6
     assert timeline[2]["planned_start"] == 5.0
+
+
+def test_short_segment_does_not_consume_large_following_gap():
+    segments = [
+        {"start": 49.72, "end": 50.69, "original_duration": 0.97, "translated_text": "roll"},
+        {"start": 51.96, "end": 52.93, "original_duration": 0.97, "translated_text": "Then it's settled"},
+        {"start": 53.24, "end": 54.21, "original_duration": 0.97, "translated_text": "I'll get out first"},
+    ]
+
+    timeline = build_tts_timeline(segments, [7.08, 1.2, 1.2], 60.0, max_speed_factor=1.5)
+
+    assert timeline[0]["overflow_reason"] == "short_segment_cap"
+    assert timeline[0]["target_duration"] <= 1.75
+    assert timeline[1]["planned_start"] == 51.96
 
 
 def test_tail_freeze_marks_last_segment_when_it_runs_past_video_end():

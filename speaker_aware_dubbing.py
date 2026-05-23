@@ -242,6 +242,17 @@ def get_voice_for_segment(
         )
     speaker_default_voice = speaker_voice_map.get(best_speaker)
     if speaker_default_voice and speaker_default_voice.startswith("clone_"):
+        speaker_info = speaker_map.get(best_speaker, {})
+        speaker_gender = speaker_info.get("gender", "unknown")
+        subtitle_gender = speaker_info.get("subtitle_gender", "unknown")
+        if _should_downgrade_clone_for_gender(
+            speaker_gender=speaker_gender,
+            subtitle_gender=subtitle_gender,
+            aligned_gender=aligned_gender,
+            aligned_confidence=aligned_confidence,
+            overlap_ratio=overlap_ratio,
+        ):
+            return _get_voice_by_gender(aligned_gender, target_lang, available_voices, fallback_voice_key)
         return speaker_default_voice
     speaker_default_gender = _voice_key_gender(speaker_default_voice) if speaker_default_voice else "unknown"
     if (
@@ -263,6 +274,34 @@ def get_voice_for_segment(
         return _get_voice_by_gender(speaker_gender, target_lang, available_voices, fallback_voice_key)
 
     return fallback_voice_key
+
+
+def _should_downgrade_clone_for_gender(
+    speaker_gender: str,
+    subtitle_gender: str,
+    aligned_gender: str,
+    aligned_confidence: float,
+    overlap_ratio: float,
+) -> bool:
+    """Return true when a clone voice is likely gender-polluted for this subtitle."""
+    if aligned_gender not in ("male", "female"):
+        return False
+    if aligned_confidence < 0.85:
+        return False
+    effective_clone_gender = speaker_gender
+    if effective_clone_gender not in ("male", "female"):
+        effective_clone_gender = subtitle_gender
+    if effective_clone_gender not in ("male", "female") or effective_clone_gender == aligned_gender:
+        return False
+    # Only a real speaker-level gender match protects clone reuse. Subtitle votes
+    # can fill missing clone gender, but they are not strong enough to block a
+    # high-confidence segment-level override on their own.
+    speaker_context_trusted = (
+        speaker_gender in ("male", "female")
+        and subtitle_gender == speaker_gender
+        and overlap_ratio >= 0.8
+    )
+    return not speaker_context_trusted
 
 
 def explain_segment_voice_alignment(

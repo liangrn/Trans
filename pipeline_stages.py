@@ -33,6 +33,7 @@ def get_or_create_audio_stage(
     run: PipelineRun,
     input_video_path: str,
     video_duration: float | None = None,
+    cascade: bool = True,
 ) -> SeparationResult:
     stage_dir = run.stage_dir("audio")
     background_path = stage_dir / "background.wav"
@@ -52,7 +53,8 @@ def get_or_create_audio_stage(
             )
         print(f"  - 音频分离阶段无效，重新生成: {reason}")
 
-    cascade_delete_dependents(run, "audio")
+    if cascade:
+        cascade_delete_dependents(run, "audio")
     _reset_stage_dir(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     work_dir = stage_dir / "_work"
@@ -90,6 +92,7 @@ def get_or_create_recognition_stage(
     video_duration: float,
     asr_audio_path: str | None = None,
     try_ocr: bool = True,
+    cascade: bool = True,
 ) -> list[dict]:
     stage_dir = run.stage_dir("recognition")
     segments_path = stage_dir / "recognized_segments.json"
@@ -102,7 +105,8 @@ def get_or_create_recognition_stage(
             return json.loads(segments_path.read_text(encoding="utf-8"))
         print(f"  - 文本识别阶段无效，重新生成: {reason}")
 
-    cascade_delete_dependents(run, "recognition")
+    if cascade:
+        cascade_delete_dependents(run, "recognition")
     _reset_stage_dir(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     ocr_segments = []
