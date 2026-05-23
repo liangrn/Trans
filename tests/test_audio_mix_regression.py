@@ -736,6 +736,198 @@ def test_voice_alignment_diagnostics_marks_fallback_source():
     assert "fallback_voice" in report["review_reasons"]
 
 
+def test_decode_infers_unknown_gender_between_same_gender_neighbors():
+    from speaker_aware_dubbing import _decode_subtitle_gender_sequence
+
+    decoded = _decode_subtitle_gender_sequence(
+        [
+            {
+                "speaker": "SPEAKER_00",
+                "start": 0.0,
+                "end": 1.0,
+                "segment_gender": "male",
+                "segment_confidence": 0.90,
+            },
+            {
+                "speaker": None,
+                "start": 1.2,
+                "end": 1.7,
+                "segment_gender": "unknown",
+                "segment_confidence": 0.0,
+            },
+            {
+                "speaker": "SPEAKER_00",
+                "start": 2.0,
+                "end": 3.0,
+                "segment_gender": "male",
+                "segment_confidence": 0.90,
+            },
+        ],
+        {"SPEAKER_00": {"male": 2.0, "female": 0.0}},
+    )
+
+    assert decoded[1]["final_gender"] == "unknown"
+    assert decoded[1]["inferred_gender"] == "male"
+    assert decoded[1]["inferred_reason"] == "between_same_neighbors"
+
+
+def test_decode_does_not_infer_unknown_between_conflicting_neighbors():
+    from speaker_aware_dubbing import _decode_subtitle_gender_sequence
+
+    decoded = _decode_subtitle_gender_sequence(
+        [
+            {
+                "speaker": "SPEAKER_00",
+                "start": 0.0,
+                "end": 1.0,
+                "segment_gender": "male",
+                "segment_confidence": 0.90,
+            },
+            {
+                "speaker": None,
+                "start": 1.2,
+                "end": 1.7,
+                "segment_gender": "unknown",
+                "segment_confidence": 0.0,
+            },
+            {
+                "speaker": "SPEAKER_01",
+                "start": 2.0,
+                "end": 3.0,
+                "segment_gender": "female",
+                "segment_confidence": 0.90,
+            },
+        ],
+        {
+            "SPEAKER_00": {"male": 1.0, "female": 0.0},
+            "SPEAKER_01": {"male": 0.0, "female": 1.0},
+        },
+    )
+
+    assert decoded[1]["final_gender"] == "unknown"
+    assert decoded[1]["inferred_gender"] == "unknown"
+    assert decoded[1]["inferred_reason"] == "unknown"
+
+
+def test_enrich_classifies_unmatched_subtitle_as_inferred_gender(monkeypatch):
+    import numpy as np
+    import librosa
+    import gender_classifier
+    import speaker_aware_dubbing
+
+    monkeypatch.setattr(librosa, "load", lambda *_args, **_kwargs: (np.zeros(16000), 16000))
+    monkeypatch.setattr(gender_classifier.GenderClassifier, "load_models", lambda self: None)
+    monkeypatch.setattr(
+        speaker_aware_dubbing,
+        "_classify_subtitle_audio_segment",
+        lambda *_args, **_kwargs: ("female", 0.90, "ecapa", "unknown", 0.0),
+    )
+
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "male",
+            "confidence": 0.9,
+            "segments": [(10.0, 12.0)],
+        }
+    }
+
+    result = speaker_aware_dubbing.enrich_speaker_map_with_subtitle_genders(
+        "dialogue.wav",
+        [{"start": 0.0, "end": 0.6, "text": "短句"}],
+        speaker_map,
+    )
+
+    global_alignments = result["SPEAKER_00"]["_all_subtitle_alignments"]
+    assert len(global_alignments) == 1
+    assert global_alignments[0]["speaker"] is None
+    assert global_alignments[0]["final_gender"] == "unknown"
+    assert global_alignments[0]["inferred_gender"] == "female"
+    assert global_alignments[0]["inferred_reason"] == "direct_segment_audio"
+
+
+def test_inferred_gender_uses_default_voice_not_clone():
+    from speaker_aware_dubbing import get_voice_for_segment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "male",
+            "subtitle_gender": "male",
+            "segments": [(10.0, 12.0)],
+            "_all_subtitle_alignments": [
+                {
+                    "start": 0.0,
+                    "end": 0.6,
+                    "final_gender": "unknown",
+                    "inferred_gender": "female",
+                    "inferred_confidence": 0.90,
+                    "inferred_reason": "direct_segment_audio",
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_00": "clone_SPEAKER_00"}
+
+    voice = get_voice_for_segment(
+        0.0,
+        0.6,
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert voice == "en_vctk_vits_f001"
+
+
+def test_voice_alignment_diagnostics_marks_short_segment_inferred_source():
+    from speaker_aware_dubbing import explain_segment_voice_alignment
+
+    voices = {
+        "en_vctk_vits_m001": {},
+        "en_vctk_vits_f001": {},
+    }
+    speaker_map = {
+        "SPEAKER_00": {
+            "gender": "male",
+            "subtitle_gender": "male",
+            "segments": [(10.0, 12.0)],
+            "_all_subtitle_alignments": [
+                {
+                    "start": 0.0,
+                    "end": 0.6,
+                    "final_gender": "unknown",
+                    "inferred_gender": "female",
+                    "inferred_confidence": 0.90,
+                    "inferred_reason": "direct_segment_audio",
+                }
+            ],
+        }
+    }
+    speaker_voice_map = {"SPEAKER_00": "clone_SPEAKER_00"}
+
+    report = explain_segment_voice_alignment(
+        0.0,
+        0.6,
+        "短句",
+        speaker_map,
+        speaker_voice_map,
+        "en_vctk_vits_m001",
+        available_voices=voices,
+        target_lang="en",
+    )
+
+    assert report["voice"] == "en_vctk_vits_f001"
+    assert report["voice_gender"] == "female"
+    assert report["voice_source"] == "short_segment_inferred"
+    assert report["inferred_gender"] == "female"
+    assert report["speaker_default_voice"] is None
+
+
 def test_voice_alignment_summary_prints_final_voice_counts(capsys):
     from speaker_aware_dubbing import print_voice_alignment_summary
 
